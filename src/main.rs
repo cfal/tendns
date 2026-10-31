@@ -1,11 +1,14 @@
 use std::{
     net::{Ipv4Addr, Ipv6Addr},
     path::PathBuf,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use hickory_proto::rr::RecordType;
 use tendns::{
+    cloudflare::{Change, Cloudflare},
     config::Config,
     names::{canonical_name, validate_label},
     protocol::{self, Entry, Publication, Secret, Value},
@@ -29,6 +32,55 @@ enum Command {
     Txt(TxtArgs),
     /// Generate a random base64url discovery key for the TOML configuration.
     Keygen,
+    /// Add or replace private entries in Cloudflare TXT using CLOUDFLARE_API_TOKEN.
+    CloudflareSet(CloudflareSetArgs),
+    /// Remove a private hostname's record type from Cloudflare TXT.
+    CloudflareRemove(CloudflareRemoveArgs),
+}
+
+#[derive(Args)]
+struct CloudflareSetArgs {
+    /// Hostname to resolve, including the label that will be encrypted.
+    #[arg(long)]
+    name: String,
+    /// Publish at this hostname instead of hiding its first label in the parent TXT.
+    #[arg(long)]
+    direct: bool,
+    #[command(flatten)]
+    value: SetValueArgs,
+    /// Refresh the whole encrypted publication's validity; defaults to the config.
+    #[arg(long)]
+    valid_for: Option<String>,
+}
+
+#[derive(Args)]
+#[group(required = true, multiple = false)]
+struct SetValueArgs {
+    #[arg(long, action = clap::ArgAction::Append)]
+    a: Vec<Ipv4Addr>,
+    #[arg(long, action = clap::ArgAction::Append)]
+    aaaa: Vec<Ipv6Addr>,
+    #[arg(long)]
+    cname: Option<String>,
+}
+
+#[derive(Args)]
+struct CloudflareRemoveArgs {
+    #[arg(long)]
+    name: String,
+    /// Remove entries at the exact hostname instead of its parent TXT.
+    #[arg(long)]
+    direct: bool,
+    #[arg(long = "type", value_enum, ignore_case = true)]
+    kind: EntryType,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+#[value(rename_all = "UPPER")]
+enum EntryType {
+    A,
+    Aaaa,
+    Cname,
 }
 
 #[derive(Args)]
@@ -72,6 +124,39 @@ async fn run(cli: Cli) -> Result<()> {
             println!("{}", generate_txt(&config, args)?);
         }
         Command::Keygen => println!("{}", Secret::generate()?),
+        Command::CloudflareSet(args) => {
+            let config = Config::load(&cli.config)?;
+            let name = canonical_name(&args.name)?;
+            let mut values = Vec::new();
+            values.extend(args.value.a.into_iter().map(Value::A));
+            values.extend(args.value.aaaa.into_iter().map(Value::Aaaa));
+            if let Some(target) = args.value.cname {
+                values.push(Value::Cname(canonical_name(&target)?));
+            }
+            let valid_for = validity(&config, args.valid_for)?;
+            let outcome = Cloudflare::from_env()?
+                .change(
+                    &config,
+                    &name,
+                    args.direct,
+                    Change::Set { values, valid_for },
+                )
+                .await?;
+            println!("{} encrypted TXT at {}", outcome.action, outcome.owner);
+        }
+        Command::CloudflareRemove(args) => {
+            let config = Config::load(&cli.config)?;
+            let name = canonical_name(&args.name)?;
+            let kind = match args.kind {
+                EntryType::A => RecordType::A,
+                EntryType::Aaaa => RecordType::AAAA,
+                EntryType::Cname => RecordType::CNAME,
+            };
+            let outcome = Cloudflare::from_env()?
+                .change(&config, &name, args.direct, Change::Remove { kind })
+                .await?;
+            println!("{} encrypted TXT at {}", outcome.action, outcome.owner);
+        }
     }
     Ok(())
 }
@@ -107,14 +192,7 @@ fn generate_txt(config: &Config, args: TxtArgs) -> Result<String> {
     for entry in args.entries {
         entries.push(parse_entry(&entry)?);
     }
-    let validity = match args.valid_for {
-        Some(value) => humantime::parse_duration(&value).context("invalid --valid-for duration")?,
-        None => config.valid_for,
-    };
-    ensure!(
-        validity.as_secs() > 0,
-        "validity must be at least one second"
-    );
+    let validity = validity(config, args.valid_for)?;
     let issued_at = SystemClock.now()?;
     let expires_at = issued_at
         .checked_add(validity.as_secs())
@@ -125,6 +203,18 @@ fn generate_txt(config: &Config, args: TxtArgs) -> Result<String> {
         entries,
     };
     protocol::encrypt(&publication, &discovery.key, &owner)
+}
+
+fn validity(config: &Config, value: Option<String>) -> Result<Duration> {
+    let validity = match value {
+        Some(value) => humantime::parse_duration(&value).context("invalid --valid-for duration")?,
+        None => config.valid_for,
+    };
+    ensure!(
+        validity.as_secs() > 0,
+        "validity must be at least one second"
+    );
+    Ok(validity)
 }
 
 fn parse_entry(text: &str) -> Result<Entry> {
@@ -164,5 +254,51 @@ mod tests {
         for entry in ["a.b:A:192.0.2.1", "nas:MX:x", "A:192.0.2.1", ":A:192.0.2.1"] {
             assert!(parse_entry(entry).is_err());
         }
+    }
+
+    #[test]
+    fn cloudflare_commands_require_one_record_type() {
+        for flags in [
+            vec!["--a", "192.0.2.1", "--a", "192.0.2.2"],
+            vec!["--aaaa", "2001:db8::1"],
+            vec!["--cname", "target.net", "--direct"],
+        ] {
+            let mut args = vec!["tendns", "cloudflare-set", "--name", "nas.example.com"];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        for flags in [
+            vec![],
+            vec!["--a", "192.0.2.1", "--aaaa", "2001:db8::1"],
+            vec!["--a", "192.0.2.1", "--cname", "target.net"],
+        ] {
+            let mut args = vec!["tendns", "cloudflare-set", "--name", "nas.example.com"];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for kind in ["A", "AAAA", "CNAME", "aaaa"] {
+            assert!(
+                Cli::try_parse_from([
+                    "tendns",
+                    "cloudflare-remove",
+                    "--name",
+                    "nas.example.com",
+                    "--type",
+                    kind
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "tendns",
+                "cloudflare-remove",
+                "--name",
+                "nas.example.com",
+                "--type",
+                "TXT"
+            ])
+            .is_err()
+        );
     }
 }

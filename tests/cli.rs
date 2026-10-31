@@ -287,3 +287,37 @@ fn keygen_needs_no_config_and_does_not_repeat() {
     }
     assert_ne!(keys[0], keys[1]);
 }
+
+#[test]
+fn cloudflare_commands_require_an_environment_token_without_disclosing_keys() {
+    let fixture = Fixture::basic();
+    for args in [
+        vec![
+            "cloudflare-set",
+            "--name",
+            "nas.example.com",
+            "--a",
+            "192.0.2.1",
+        ],
+        vec![
+            "cloudflare-remove",
+            "--name",
+            "nas.example.com",
+            "--type",
+            "A",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_tendns"))
+            .arg("--config")
+            .arg(&fixture.path)
+            .args(args)
+            .env_remove("CLOUDFLARE_API_TOKEN")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("CLOUDFLARE_API_TOKEN"));
+        assert!(!error.contains(KEY));
+    }
+}

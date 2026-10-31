@@ -79,6 +79,58 @@ Values longer than 255 bytes must be split into adjacent character-strings
 within **one** TXT record, with no inserted spaces in the data. Do not publish
 the fragments as separate records. The server concatenates strings per RR.
 
+## Publish with Cloudflare
+
+`cloudflare-set` and `cloudflare-remove` use the same TOML discovery keys and a
+native HTTPS client. Set `CLOUDFLARE_API_TOKEN` to a token with **Zone Read** and
+**DNS Write** permissions, scoped to the relevant zones. The commands discover
+the most-specific accessible Cloudflare zone containing the TXT owner. No zone
+ID, provider credentials in TOML, or external `curl` executable is required.
+
+```sh
+tendns --config tendns.toml cloudflare-set --name nas.example.com --a 192.0.2.10
+tendns --config tendns.toml cloudflare-set --name nas.example.com --aaaa 2001:db8::10
+tendns --config tendns.toml cloudflare-set --name www.example.com --cname target.example.net
+tendns --config tendns.toml cloudflare-remove --name nas.example.com --type A
+```
+
+Here `--name` is the **hostname clients resolve**, unlike `txt --name`, which
+specifies the public TXT owner. By default these commands edit TXT at the
+immediate parent (`example.com`) and keep the child label (`nas` or `www`)
+encrypted. `--direct` edits TXT at the exact hostname with an empty hidden label.
+At a configured discovery domain's apex, `--direct` is required: publishing in
+its parent would cross the key boundary. A direct set is refused when an existing
+parent entry shadows it or the parent TXT lookup would fail validation.
+
+Set reuses the owner's existing `td1` TXT: decrypt, edit the array, re-encrypt,
+and PATCH the same Cloudflare record. It creates a TXT record only when none
+contains an encrypted publication. Other TXT records and Cloudflare comments/tags
+are left untouched; hidden labels are never written into provider metadata.
+
+Entries are keyed by hostname and type. A missing type is appended; setting an
+existing type replaces all its values while preserving other types and hostnames.
+`--a` and `--aaaa` are repeatable for multiple addresses, but one invocation sets
+only one type. CNAME/address conflicts are errors, not implicit deletions.
+Remove deletes all values of the selected hostname/type, preserving the original
+publication timestamps and DNS TTL; it deletes the TXT record only if empty.
+An absent entry is reported as an error. Placement is not migrated automatically:
+removing a hidden entry can expose a previously shadowed direct entry.
+
+**Set refreshes validity for every entry in that encrypted TXT**, including
+unchanged entries. Use `--valid-for` to override the configured duration. Expired
+but authenticated publications can be refreshed; unreadable ciphertext and
+multiple encrypted records at one owner are refused without changes. Consolidate
+multiple publications manually before managing that owner with these commands.
+Set applies the configured `ttl`, which must be 60–86400 seconds or `1` for
+Cloudflare Auto (normally 300 seconds). Values are split into quoted TXT strings;
+provider size limits and the resolver's record limits are checked before writing.
+
+Run only one writer per TXT owner. Cloudflare does not provide a documented
+conditional update for this read-modify-write operation; concurrent commands can
+lose updates. Redirects and automatic retries are disabled. After a timeout or
+other uncertain write result, check the provider state before retrying. These
+commands do not schedule renewals or detect address changes.
+
 ## Lookup behavior
 
 For a discovery query such as `a.example.com`, tendns first checks TXT at its
@@ -102,7 +154,7 @@ Publish independent `td1.` values as separate TXT records, not strings within on
 Timestamps validate freshness, not replacement order. Replace or remove old TXT
 values explicitly when updating. An invalid or expired encrypted value fails the
 lookup, including when other values are valid: it might contain the hidden label
-being queried. Publication is manual; regenerate and republish before expiry,
+being queried. Publication is operator-triggered; regenerate and republish before expiry,
 including when addresses are unchanged.
 
 For a configured hex zone, `c0000201.hex.example.net` resolves to `192.0.2.1`.
@@ -135,7 +187,8 @@ There is no persistent replay state. Authentic older values may be accepted
 until expiry; a reasonably correct clock is required. SIV is a safety net against
 accidental nonce reuse, not replay protection. Removing a TXT record does not
 erase addresses clients already learned. Configuration keys are separate from
-provider API credentials; tendns does not need provider credentials.
+provider API credentials. Only the Cloudflare publishing commands need a provider
+token, read from `CLOUDFLARE_API_TOKEN`; the DNS server does not.
 
 ## Check
 

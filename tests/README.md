@@ -17,7 +17,12 @@ cargo fmt --all -- --check
 - Unit tests in `src/config.rs` and `src/names.rs`: domain matching, configuration
   validation, upstream restrictions, DNS-name canonicalization, and redacted errors.
 - `cli.rs`: offline TXT generation, repeated flags, aliases, validity, distinct
-  domain/subdomain keys, invalid arguments, and config-independent key generation.
+  domain/subdomain keys, invalid arguments, config-independent key generation,
+  and Cloudflare token requirements.
+- `src/cloudflare/tests.rs`: local HTTPS API fixtures covering parent/direct
+  placement, array updates, removal, pagination, invalid/ambiguous ciphertext,
+  TXT quoting/decimal escapes, size limits, CNAME conflicts, write-response
+  verification, API failures, and secret-safe errors. No live account is used.
 - `resolution.rs`: hidden-label precedence, no-fallback failure behavior, TXT
   record boundaries/filtering, record-type semantics, CNAME limits, and hex names.
 - `resolution/cache.rs`: paused-clock TTL tests, actual overlapping fetches,
