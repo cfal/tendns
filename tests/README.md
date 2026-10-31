@@ -33,6 +33,14 @@ cargo fmt --all -- --check
   overload recovery, and encrypted discovery through real local DNS listeners.
 - `process.rs` (Unix): generate a key and TXT with the CLI, resolve through the
   actual server process, shut down with SIGTERM, and clean up partial bind failures.
+- `doh_server.rs` (Unix): real HTTP/HTTPS listeners with binary GET/POST and JSON
+  GET, HTTP/1.1 and HTTP/2, per-listener inline/file bearer tokens, startup-only
+  credentials, TLS verification/plaintext rejection, malformed requests/body
+  deadlines, file-descriptor exhaustion recovery, and mixed DNS/DoH shutdown.
+- `src/server/doh/tests.rs`: token parsing, authentication, content negotiation,
+  JSON query names/flags, and lossless character-string/generic RDATA rendering;
+  listener configuration tests also cover typed fields and config-relative
+  credential paths.
 
 Network fixtures use ephemeral ports. Bound reads and fixture joins turn broken
 transport behavior into failures rather than indefinite waits. DoH worker panics

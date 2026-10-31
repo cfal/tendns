@@ -1,6 +1,6 @@
 # tendns
 
-A Rust DNS forwarder with ordinary UDP/TCP and DoH upstreams, encrypted TXT
+A Rust DNS forwarder with UDP/TCP and HTTP/HTTPS listeners, DoH upstreams, encrypted TXT
 discovery, and hexadecimal IPv4 names. Built on Hickory DNS.
 
 ## Build and run
@@ -16,7 +16,8 @@ target/release/tendns --config tendns.toml serve
 Use `tendns.example.toml` as the configuration reference. Set a fresh generated
 key for each discovery domain. The example binds UDP and TCP on `0.0.0.0:5300`.
 Port 53 may require elevated binding privileges. Keeping the listener internal
-is the operator's responsibility; there is no access-control layer.
+is the operator's responsibility. UDP/TCP DNS has no authentication; HTTP/HTTPS
+listeners support bearer tokens.
 
 Use port 53 for clients whose resolver configuration cannot specify a port.
 For a quick check of the example's listener:
@@ -29,6 +30,81 @@ dig @127.0.0.1 -p 5300 example.net A +tcp
 Protect configuration files containing keys with appropriate filesystem
 permissions, such as mode `0600`. `tendns.toml` is ignored by Git. Keys are
 32 random bytes represented as unpadded base64url, not passwords.
+
+## Listeners and DoH
+
+Listeners use typed TOML entries. This replaces the earlier `listen = [...]`
+format. With no `listeners` specified, the default is UDP/TCP on `0.0.0.0:5300`.
+An explicit list can contain only HTTP/HTTPS listeners, without ordinary DNS.
+
+```toml
+[[listeners]]
+type = "dns"
+address = "0.0.0.0:5300"
+
+[[listeners]]
+type = "http"
+address = "0.0.0.0:8053"
+auth_tokens = ["replace-with-a-random-token"]
+
+[[listeners]]
+type = "https"
+address = "0.0.0.0:8443"
+cert = "server.crt"
+key = "server.key"
+auth_tokens = ["another-random-token"]
+auth_token_file = "tokens.txt"
+```
+
+HTTPS requires a PEM certificate chain and an unencrypted PEM private key
+(PKCS#8, PKCS#1, or SEC1). Certificates, keys, and token files load **once at
+startup**; restart to rotate them. Relative paths resolve beside the TOML file.
+Invalid or unreadable configured files fail startup before listeners are advertised.
+
+Authentication is independent per HTTP/HTTPS listener. `auth_tokens` and
+`auth_token_file` are optional and additive: any token from either source is
+accepted through `Authorization: Bearer TOKEN`. Files contain one token per line;
+LF and CRLF are accepted and empty lines ignored. Tokens are case-sensitive,
+contain no whitespace, and use the bearer-token alphabet (letters, digits,
+`-._~+/`, and optional trailing `=`). Limits: 1024 tokens per listener, 1024 bytes
+per token, 1 MiB per file. `tendns keygen` can generate suitable random tokens;
+generate separate values rather than reusing discovery encryption keys.
+
+An empty combined token list disables authentication and prints a warning for
+that listener. Missing or invalid credentials produce HTTP 401 with a Bearer
+challenge. DNS listeners reject auth fields. Protect token files like private
+keys. Plain HTTP exposes queries, answers, and bearer tokens: use HTTPS outside
+trusted networks. Authentication does not make an HTTP connection encrypted.
+
+Both HTTP/1.1 and HTTP/2 use `/dns-query` and the existing resolver, cache, and
+global query concurrency/deadline limits:
+
+- **Binary (RFC 8484):** GET `?dns=BASE64URL` with an unpadded DNS wire message,
+  or POST a DNS wire message with `Content-Type: application/dns-message`.
+- **JSON (common, non-standard DNS JSON format):** GET
+  `?name=example.com&type=A`, with symbolic or numeric `type` (default `A`).
+  Optional `do` and `cd` accept `true`/`false` or `1`/`0`.
+- `Accept: application/dns-message` or `application/dns-json` selects the response
+  format; quality weights and wildcards are supported. Without `Accept`, `name`
+  queries default to JSON and wire queries to binary. JSON POST is not supported.
+- JSON includes `Status`, DNS flags, `Question`, `Answer`, `Authority`, and
+  `Additional`; record data uses DNS presentation syntax, including RFC 3597
+  generic `\# length hex` for SVCB, HTTPS, NULL, and unknown types. DNS failures
+  are HTTP 200 with their DNS status. Malformed HTTP queries use HTTP error statuses.
+
+```sh
+curl --cacert server.crt \
+  -H "Authorization: Bearer $DNS_TOKEN" \
+  -H 'Accept: application/dns-json' \
+  'https://localhost:8443/dns-query?name=c0000201.hex.example.net&type=A'
+```
+
+Responses use `Cache-Control: no-store` to avoid shared HTTP caches retaining
+private answers; DNS TTLs still apply. Request URIs are limited to 8 KiB, binary
+POST bodies to 65535 bytes, and body reads to `request_timeout`. HTTP connections
+and in-flight HTTP requests are each bounded by `max_inflight` per listener.
+Connections are rotated after five minutes, with a short graceful-close window.
+No CORS access or client-subnet parameter support is enabled.
 
 ## Releases
 
