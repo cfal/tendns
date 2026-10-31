@@ -5,7 +5,7 @@ discovery, and hexadecimal IPv4 names. Built on Hickory DNS.
 
 ## Build and run
 
-Requires Rust 1.88 or newer and a C toolchain for AWS-LC.
+Requires Rust 1.99.1 or newer and a C toolchain for AWS-LC.
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo build --release
@@ -29,6 +29,20 @@ dig @127.0.0.1 -p 5300 example.net A +tcp
 Protect configuration files containing keys with appropriate filesystem
 permissions, such as mode `0600`. `tendns.toml` is ignored by Git. Keys are
 32 random bytes represented as unpadded base64url, not passwords.
+
+## Releases
+
+The `release-*` branch builds and tests the same source as the `v*` release tag.
+Dependencies use broad manifest constraints; `Cargo.lock` fixes the exact
+release graph, and CI builds with `--locked`. Releases are distributed through
+GitHub, not crates.io.
+
+The release workflow packages and smoke-tests eight binaries: Linux x86_64
+(GNU and musl), Linux aarch64 (GNU and musl), Linux armv7 (GNU and musl), and
+macOS x86_64 and aarch64. Each archive contains `tendns`, this README, and
+`tendns.example.toml`; the release includes `SHA256SUMS` and build-provenance
+attestations. A tag creates a draft release after all builds pass. The draft is
+published only after reviewing the artifacts.
 
 ## Generate TXT values
 

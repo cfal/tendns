@@ -1,37 +1,39 @@
 [package]
 name = "tendns"
 version = "0.1.0"
+publish = false
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.99.1"
 description = "DNS forwarder with encrypted TXT discovery and hexadecimal IPv4 names"
+repository = "https://github.com/cfal/tendns"
 
 [dependencies]
-anyhow = "1"
-async-trait = "0.1"
-aws-lc-rs = "1.19"
-base64 = "0.22"
-clap = { version = "4", features = ["derive"] }
-hickory-proto = "=0.26.3"
-hickory-resolver = { version = "=0.26.3", default-features = false, features = ["tokio", "https-aws-lc-rs", "webpki-roots"] }
-hickory-server = { version = "=0.26.3", default-features = false }
-humantime = "2"
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json", "query"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-util"] }
-toml = "0.9"
-url = "2"
-zeroize = "1"
+anyhow = "*"
+async-trait = "*"
+aws-lc-rs = "*"
+base64 = "*"
+clap = { version = "*", features = ["derive"] }
+hickory-proto = "*"
+hickory-resolver = { version = "*", default-features = false, features = ["tokio", "https-aws-lc-rs", "webpki-roots"] }
+hickory-server = { version = "*", default-features = false }
+humantime = "*"
+reqwest = { version = "*", default-features = false, features = ["rustls", "http2", "json", "query"] }
+serde = { version = "*", features = ["derive"] }
+serde_json = "*"
+tokio = { version = "*", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-util"] }
+toml = "*"
+url = "*"
+zeroize = "*"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["test-util", "process"] }
-h2 = "0.4"
-http = "1"
-bytes = "1"
-rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs"] }
-rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
-tempfile = "3"
-tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+tokio = { version = "*", features = ["test-util", "process"] }
+h2 = "*"
+http = "*"
+bytes = "*"
+rcgen = { version = "*", default-features = false, features = ["crypto", "aws_lc_rs"] }
+rustls = { version = "*", default-features = false, features = ["std", "aws_lc_rs"] }
+tempfile = "*"
+tokio-rustls = { version = "*", default-features = false, features = ["aws_lc_rs"] }
 
 [profile.dev]
 debug = 0
