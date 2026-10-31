@@ -140,8 +140,11 @@ impl Exchange for Forwarder {
         let mut last_error = None;
         for target in &self.targets {
             for conn in &target.connections {
-                match tokio::time::timeout(self.timeout, self.send(target, conn, &message)).await {
-                    Ok(Ok(mut response)) => {
+                let result = tokio::time::timeout(self.timeout, self.send(target, conn, &message))
+                    .await
+                    .unwrap_or_else(|error| Err(error.into()));
+                match result {
+                    Ok(mut response) => {
                         if response.metadata.truncation {
                             continue;
                         }
@@ -155,12 +158,8 @@ impl Exchange for Forwarder {
                         }
                         return Ok(response);
                     }
-                    Ok(Err(error)) => {
-                        last_error = Some(error);
-                        *conn.handle.lock().await = None;
-                    }
                     Err(error) => {
-                        last_error = Some(error.into());
+                        last_error = Some(error);
                         *conn.handle.lock().await = None;
                     }
                 }
