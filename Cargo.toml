@@ -29,7 +29,7 @@ required-features = ["cli"]
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"
-aws-lc-rs = { version = "1.19", default-features = false, features = ["alloc", "non-fips"] }
+aws-lc-rs = { version = "1.19", default-features = false, features = ["alloc", "aws-lc-sys"] }
 base64 = "0.22"
 bytes = { version = "1.12", optional = true }
 clap = { version = "4.6", features = ["derive"], optional = true }
