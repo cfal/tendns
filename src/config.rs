@@ -287,4 +287,36 @@ mod tests {
             assert!(!error.contains(KEY));
         }
     }
+
+    #[test]
+    fn rejects_ambiguous_zones_invalid_limits_and_unsupported_upstreams() {
+        let discovery = format!("[[discovery]]\ndomain='example.com'\nkey='{KEY}'\n");
+        for text in [
+            "listen=['0.0.0.0:0']".to_owned(),
+            "cache_capacity=0".to_owned(), "cache_capacity=65537".to_owned(),
+            "max_inflight=0".to_owned(), "max_inflight=65537".to_owned(),
+            "valid_for='0s'".to_owned(), "upstream_timeout='500ms'".to_owned(),
+            "request_timeout='not a duration'".to_owned(),
+            "hex_zones=['EXAMPLE.COM', 'example.com.']".to_owned(),
+            "hex_zones=['a.example.com', 'example.com']".to_owned(),
+            format!("hex_zones=['com']\n{discovery}"),
+            format!("{discovery}[[discovery]]\ndomain='EXAMPLE.COM.'\nkey='{KEY}'"),
+            "[[upstreams]]\ntype='dot'\naddress='1.1.1.1:853'".to_owned(),
+            "[[upstreams]]\ntype='plain'\naddress='0.0.0.0:53'".to_owned(),
+            "[[upstreams]]\ntype='plain'\naddress='1.1.1.1:0'".to_owned(),
+            "[[upstreams]]\ntype='doh'\nurl='https://user:secret@dns.test/dns-query'\nbootstrap=['1.1.1.1']".to_owned(),
+            "[[upstreams]]\ntype='doh'\nurl='https://dns.test/dns-query#fragment'\nbootstrap=['1.1.1.1']".to_owned(),
+            "[[upstreams]]\ntype='doh'\nurl='https://dns.test/dns-query'\nbootstrap=['::']".to_owned(),
+        ] {
+            let error = Config::parse(&text).err().expect("invalid configuration accepted");
+            assert!(!format!("{error:#}").contains(KEY));
+        }
+        let defaults = Config::parse("").unwrap();
+        assert!(
+            defaults.upstreams.is_empty(),
+            "offline key/TXT generation needs no upstream"
+        );
+        assert_eq!(defaults.listen, vec!["0.0.0.0:5300".parse().unwrap()]);
+        assert!(Config::parse("cache_capacity=65536\nmax_inflight=65536").is_ok());
+    }
 }

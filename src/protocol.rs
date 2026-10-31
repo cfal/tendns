@@ -414,4 +414,165 @@ mod tests {
         publication.entries[0].subdomain = "a.b".into();
         assert!(publication.encode(&owner).is_err());
     }
+
+    #[test]
+    fn every_entry_type_rejects_partial_encoding() {
+        let (owner, _, publication) = fixture();
+        for entry in publication.entries {
+            let one = Publication {
+                issued_at: 100,
+                expires_at: 200,
+                entries: vec![entry],
+            };
+            let bytes = one.encode(&owner).unwrap();
+            for end in 0..bytes.len() {
+                assert!(
+                    Publication::decode(&bytes[..end], &owner).is_err(),
+                    "entry {:?}, prefix {end}",
+                    one.entries[0]
+                );
+            }
+            assert_eq!(Publication::decode(&bytes, &owner).unwrap(), one);
+        }
+    }
+
+    #[test]
+    fn malformed_entry_fields_are_rejected() {
+        let (owner, _, _) = fixture();
+        let header = [100u64.to_be_bytes(), 200u64.to_be_bytes()].concat();
+        for (label, entry) in [
+            ("unknown type", vec![3, 0]),
+            ("invalid UTF-8 label", vec![0, 1, 255, 192, 0, 2, 1]),
+            ("uppercase label", vec![0, 1, b'A', 192, 0, 2, 1]),
+            ("dotted label", vec![0, 3, b'a', b'.', b'b', 192, 0, 2, 1]),
+            ("relative CNAME", vec![2, 0, 0, 3, b'a', b'.', b'b']),
+            ("empty CNAME", vec![2, 0, 0, 0]),
+            ("invalid UTF-8 CNAME", vec![2, 0, 0, 2, 255, b'.']),
+            ("overstated CNAME length", vec![2, 0, 255, 255, b'a', b'.']),
+        ] {
+            assert!(
+                Publication::decode(&[header.as_slice(), &entry].concat(), &owner).is_err(),
+                "{label}"
+            );
+        }
+        assert!(Publication::decode(&header, &owner).is_err());
+    }
+
+    #[test]
+    fn size_and_entry_limits_accept_the_boundary_only() {
+        let (owner, secret, mut publication) = fixture();
+        let entry = publication.entries[0].clone();
+        publication.entries = vec![entry.clone(); MAX_ENTRIES];
+        let mut encoded = publication.encode(&owner).unwrap();
+        assert_eq!(
+            Publication::decode(&encoded, &owner).unwrap().entries.len(),
+            MAX_ENTRIES
+        );
+        publication.entries.push(entry);
+        assert!(publication.encode(&owner).is_err());
+        encoded.extend([0, 0, 192, 0, 2, 1]);
+        assert!(Publication::decode(&encoded, &owner).is_err());
+
+        publication.entries = vec![
+            Entry {
+                subdomain: "abcdefghij".into(),
+                value: Value::A(Ipv4Addr::LOCALHOST)
+            };
+            255
+        ];
+        assert_eq!(publication.encode(&owner).unwrap().len(), MAX_PLAINTEXT);
+        let encrypted = encrypt(&publication, &secret, &owner).unwrap();
+        assert!(encrypted.len() <= MAX_ENCODED);
+        assert_eq!(
+            decrypt(encrypted.as_bytes(), &secret, &owner, 100).unwrap(),
+            publication
+        );
+        publication.entries[0].subdomain.push('k');
+        assert!(publication.encode(&owner).is_err());
+        assert!(decrypt(&vec![b'a'; MAX_ENCODED + 1], &secret, &owner, 100).is_err());
+    }
+
+    #[test]
+    fn timestamp_and_label_boundaries_are_enforced() {
+        let (owner, _, mut publication) = fixture();
+        for expiry in [0, 99, 100] {
+            publication.expires_at = expiry;
+            assert!(publication.encode(&owner).is_err(), "expiry {expiry}");
+        }
+        publication.expires_at = 200;
+        for (now, valid) in [
+            (39, false),
+            (40, true),
+            (199, true),
+            (200, false),
+            (u64::MAX, false),
+        ] {
+            assert_eq!(publication.validate_time(now).is_ok(), valid, "now {now}");
+        }
+        publication.entries.truncate(1);
+        publication.entries[0].subdomain = "a".repeat(63);
+        assert!(publication.encode(&owner).is_ok());
+        publication.entries[0].subdomain.push('a');
+        assert!(publication.encode(&owner).is_err());
+    }
+
+    #[test]
+    fn authentication_and_plaintext_validation_are_independent() {
+        let (owner, secret, _) = fixture();
+        let nonce = [0; 12];
+        let mut malformed = [100u64.to_be_bytes(), 200u64.to_be_bytes()].concat();
+        malformed.extend([3, 0]);
+        key(&secret, &owner)
+            .unwrap()
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(aad(&owner)),
+                &mut malformed,
+            )
+            .unwrap();
+        let envelope = format!(
+            "td1.{}",
+            URL_SAFE_NO_PAD.encode([nonce.as_slice(), &malformed].concat())
+        );
+        assert_eq!(
+            decrypt(envelope.as_bytes(), &secret, &owner, 100)
+                .unwrap_err()
+                .to_string(),
+            "unsupported entry type"
+        );
+
+        let (_, _, publication) = fixture();
+        let mut body = publication.encode(&owner).unwrap();
+        key(&secret, &owner)
+            .unwrap()
+            .seal_in_place_append_tag(
+                aead::Nonce::assume_unique_for_key(nonce),
+                aead::Aad::from(b"wrong protocol context"),
+                &mut body,
+            )
+            .unwrap();
+        let envelope = format!(
+            "td1.{}",
+            URL_SAFE_NO_PAD.encode([nonce.as_slice(), &body].concat())
+        );
+        assert_eq!(
+            decrypt(envelope.as_bytes(), &secret, &owner, 100)
+                .unwrap_err()
+                .to_string(),
+            "TXT authentication failed"
+        );
+    }
+
+    #[test]
+    fn secrets_require_exact_length_and_canonical_base64url() {
+        for value in [
+            String::new(),
+            URL_SAFE_NO_PAD.encode([0; 31]),
+            URL_SAFE_NO_PAD.encode([0; 33]),
+            format!("{}=", URL_SAFE_NO_PAD.encode([0; 32])),
+            "!".repeat(43),
+        ] {
+            assert!(Secret::decode(&value).is_err());
+        }
+    }
 }
