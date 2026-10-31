@@ -1,181 +1,54 @@
-use std::{net::IpAddr, sync::Arc, time::Duration};
+//! Application-provided DNS transport.
 
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use hickory_proto::op::{DnsRequest, Message, MessageType, ResponseCode};
-use hickory_resolver::{
-    ConnectionProvider, PoolContext, TlsConfig,
-    config::{ConnectionConfig, ResolverOpts},
-    net::{
-        runtime::TokioRuntimeProvider,
-        xfer::{DnsExchange, DnsHandle, FirstAnswer},
-    },
-};
-use tokio::sync::Mutex;
+use hickory_proto::op::Message;
+use tokio::time::Instant;
 
-use crate::config::Upstream;
+#[cfg(feature = "cli")]
+mod forwarder;
+#[cfg(feature = "cli")]
+pub use forwarder::Forwarder;
 
+/// Exchanges raw DNS messages without re-entering tendns namespace handling.
+///
+/// Implementations must associate responses with their requests, and retry
+/// truncated UDP responses over a reliable transport before returning them.
 #[async_trait]
 pub trait Exchange: Send + Sync {
     async fn exchange(&self, message: Message) -> Result<Message>;
-}
 
-pub struct Forwarder {
-    targets: Vec<Target>,
-    context: Arc<PoolContext>,
-    runtime: TokioRuntimeProvider,
-    timeout: Duration,
-}
-
-struct Target {
-    ip: IpAddr,
-    connections: Vec<Connection>,
-}
-
-struct Connection {
-    config: ConnectionConfig,
-    handle: Mutex<Option<DnsExchange<TokioRuntimeProvider>>>,
-}
-
-impl Forwarder {
-    pub fn new(upstreams: &[Upstream], timeout: Duration) -> Result<Self> {
-        Self::with_tls(upstreams, timeout, TlsConfig::new()?)
-    }
-
-    pub fn with_tls(upstreams: &[Upstream], timeout: Duration, tls: TlsConfig) -> Result<Self> {
-        ensure!(
-            !upstreams.is_empty(),
-            "configure at least one upstream to serve DNS"
-        );
-        let mut options = ResolverOpts::default();
-        options.timeout = timeout;
-        let context = Arc::new(PoolContext::new(options, tls));
-        let mut targets = Vec::new();
-        for upstream in upstreams {
-            let (ips, configs) = match upstream {
-                Upstream::Plain(addr) => {
-                    let mut udp = ConnectionConfig::udp();
-                    udp.port = addr.port();
-                    let mut tcp = ConnectionConfig::tcp();
-                    tcp.port = addr.port();
-                    (vec![addr.ip()], vec![udp, tcp])
-                }
-                Upstream::Doh { url, bootstrap } => {
-                    let mut path = url.path().to_owned();
-                    if let Some(query) = url.query() {
-                        path.push('?');
-                        path.push_str(query);
-                    }
-                    let mut config = ConnectionConfig::https(
-                        Arc::from(url.host_str().context("missing DoH host")?),
-                        Some(Arc::from(path)),
-                    );
-                    config.port = url.port_or_known_default().context("missing DoH port")?;
-                    (bootstrap.clone(), vec![config])
-                }
-            };
-            for ip in ips {
-                targets.push(Target {
-                    ip,
-                    connections: configs
-                        .iter()
-                        .map(|config| Connection {
-                            config: config.clone(),
-                            handle: Mutex::new(None),
-                        })
-                        .collect(),
-                });
-            }
-        }
-        Ok(Self {
-            targets,
-            context,
-            runtime: TokioRuntimeProvider::default(),
-            timeout,
-        })
-    }
-
-    async fn send(&self, target: &Target, conn: &Connection, request: &Message) -> Result<Message> {
-        let mut reconnect = true;
-        let response = loop {
-            let (handle, reused) = {
-                let mut slot = conn.handle.lock().await;
-                let reused = slot.is_some();
-                if slot.is_none() {
-                    *slot = Some(
-                        self.runtime
-                            .new_connection(target.ip, &conn.config, &self.context)?
-                            .await?,
-                    );
-                }
-                (slot.as_ref().expect("initialized handle").clone(), reused)
-            };
-            match handle
-                .send(DnsRequest::from(request.clone()))
-                .first_answer()
-                .await
-            {
-                Ok(response) => break response.into_message(),
-                Err(_) if reused && reconnect => {
-                    // An idle TCP/HTTP2 connection may have closed since the last query.
-                    *conn.handle.lock().await = None;
-                    reconnect = false;
-                }
-                Err(error) => return Err(error.into()),
-            }
-        };
-        ensure!(
-            response.metadata.message_type == MessageType::Response
-                && response.metadata.op_code == request.metadata.op_code,
-            "invalid upstream response header"
-        );
-        ensure!(
-            response.queries == request.queries,
-            "upstream question does not match request"
-        );
-        Ok(response)
+    /// Uses the caller's absolute deadline, rather than restarting a timeout for
+    /// each TXT owner or CNAME. Override when the underlying resolver supports it.
+    async fn exchange_with_deadline(&self, message: Message, deadline: Instant) -> Result<Message> {
+        tokio::time::timeout_at(deadline, self.exchange(message))
+            .await
+            .context("DNS exchange timed out")?
     }
 }
 
-#[async_trait]
-impl Exchange for Forwarder {
-    async fn exchange(&self, message: Message) -> Result<Message> {
-        let mut last_dns_error = None;
-        let mut last_error = None;
-        for target in &self.targets {
-            for conn in &target.connections {
-                match tokio::time::timeout(self.timeout, self.send(target, conn, &message)).await {
-                    Ok(Ok(mut response)) => {
-                        if response.metadata.truncation {
-                            continue;
-                        }
-                        response.metadata.id = message.metadata.id;
-                        if matches!(
-                            response.metadata.response_code,
-                            ResponseCode::ServFail | ResponseCode::Refused
-                        ) {
-                            last_dns_error = Some(response);
-                            break;
-                        }
-                        return Ok(response);
-                    }
-                    Ok(Err(error)) => {
-                        last_error = Some(error);
-                        *conn.handle.lock().await = None;
-                    }
-                    Err(error) => {
-                        last_error = Some(error.into());
-                        *conn.handle.lock().await = None;
-                    }
-                }
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{future::pending, time::Duration};
+
+    struct PendingExchange;
+
+    #[async_trait]
+    impl Exchange for PendingExchange {
+        async fn exchange(&self, _: Message) -> Result<Message> {
+            pending().await
         }
-        if let Some(response) = last_dns_error {
-            return Ok(response);
-        }
-        if let Some(error) = last_error {
-            return Err(error.context("all configured upstreams failed"));
-        }
-        bail!("all configured upstreams failed")
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_exchange_enforces_the_callers_deadline() {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let error = PendingExchange
+            .exchange_with_deadline(Message::query(), deadline)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "DNS exchange timed out");
+        assert_eq!(Instant::now(), deadline);
     }
 }

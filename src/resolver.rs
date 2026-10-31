@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
-    net::Ipv4Addr,
+    future::Future,
+    net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -16,7 +17,7 @@ use hickory_proto::{
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
-    config::{Config, Discovery},
+    policy::{Discovery, Policy},
     protocol::{self, Entry, Publication, Value},
     upstream::Exchange,
 };
@@ -36,8 +37,12 @@ impl Clock for SystemClock {
     }
 }
 
+/// Resolution and publication caching for one immutable policy and upstream.
+///
+/// Create separate instances for different upstream policies, even when they use
+/// the same keys. The resolver never opens sockets or loads configuration files.
 pub struct Resolver {
-    config: Arc<Config>,
+    policy: Arc<Policy>,
     upstream: Arc<dyn Exchange>,
     clock: Arc<dyn Clock>,
     cache: Mutex<HashMap<Name, Arc<Mutex<Option<Cached>>>>>,
@@ -59,25 +64,165 @@ enum Local {
     },
 }
 
+/// Address-family selection for application lookups.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IpStrategy {
+    Ipv4Only,
+    Ipv6Only,
+    #[default]
+    Ipv4ThenIpv6,
+    Ipv6ThenIpv4,
+    Ipv4AndIpv6,
+}
+
+impl IpStrategy {
+    fn select(self, addresses: &mut Vec<IpAddr>) {
+        let has_v4 = addresses.iter().any(IpAddr::is_ipv4);
+        let has_v6 = addresses.iter().any(IpAddr::is_ipv6);
+        addresses.retain(|ip| match self {
+            Self::Ipv4Only => ip.is_ipv4(),
+            Self::Ipv6Only => ip.is_ipv6(),
+            Self::Ipv4ThenIpv6 => !has_v4 || ip.is_ipv4(),
+            Self::Ipv6ThenIpv4 => !has_v6 || ip.is_ipv6(),
+            Self::Ipv4AndIpv6 => true,
+        });
+    }
+}
+
+/// Negative private lookup results, distinct from authentication/transport errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LookupError {
+    NotFound,
+    NoData,
+}
+
+impl std::fmt::Display for LookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NotFound => "private name does not exist",
+            Self::NoData => "name has no addresses for the requested family",
+        })
+    }
+}
+
+impl std::error::Error for LookupError {}
+
 impl Resolver {
-    pub fn new(config: Arc<Config>, upstream: Arc<dyn Exchange>) -> Self {
-        Self::with_clock(config, upstream, Arc::new(SystemClock))
+    pub fn new(policy: Arc<Policy>, upstream: Arc<dyn Exchange>) -> Self {
+        Self::with_clock(policy, upstream, Arc::new(SystemClock))
     }
 
     pub fn with_clock(
-        config: Arc<Config>,
+        policy: Arc<Policy>,
         upstream: Arc<dyn Exchange>,
         clock: Arc<dyn Clock>,
     ) -> Self {
         Self {
-            config,
+            policy,
             upstream,
             clock,
             cache: Mutex::new(HashMap::new()),
         }
     }
 
+    /// Answers a DNS message without an overall timeout. Packet-serving callers
+    /// should apply [`validate_request`] before invoking this method, and either
+    /// enforce their own deadline or use [`Self::answer_with_deadline`].
     pub async fn answer(&self, request: Message) -> Result<Message> {
+        self.answer_inner(request, None).await
+    }
+
+    /// Covers the entire request, including cache waits and all CNAME/TXT steps.
+    pub async fn answer_with_deadline(
+        &self,
+        request: Message,
+        deadline: Instant,
+    ) -> Result<Message> {
+        ensure!(Instant::now() < deadline, "DNS resolution timed out");
+        tokio::time::timeout_at(deadline, self.answer_inner(request, Some(deadline)))
+            .await
+            .context("DNS resolution timed out")?
+    }
+
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    /// Resolves private/hex addresses, following local CNAMEs before handing an
+    /// external terminal name to the application's ordinary address resolver.
+    ///
+    /// The fallback is never called for a missing or invalid private name. It
+    /// receives the original absolute deadline and can preserve native OS/NSS
+    /// behavior. Private chain expiry is checked again after the fallback returns.
+    /// Do not cache the returned addresses with a fixed lifetime: the resolver's
+    /// own publication cache already enforces TTL and authenticated expiry.
+    pub async fn lookup_ip<F, Fut>(
+        &self,
+        name: Name,
+        strategy: IpStrategy,
+        deadline: Instant,
+        fallback: F,
+    ) -> Result<Vec<IpAddr>>
+    where
+        F: FnOnce(Name, Instant) -> Fut,
+        Fut: Future<Output = Result<Vec<IpAddr>>>,
+    {
+        ensure!(Instant::now() < deadline, "DNS resolution timed out");
+        tokio::time::timeout_at(deadline, async {
+            let mut name = name;
+            if self.policy.claims(&name) {
+                name = name.to_lowercase();
+                name.set_fqdn(true);
+            }
+            let mut seen = HashSet::new();
+            let mut expires_at: Option<u64> = None;
+            for _ in 0..16 {
+                ensure!(seen.insert(name.clone()), "CNAME loop");
+                let mut addresses = match self.local(&name, Some(deadline)).await? {
+                    Local::Forward => fallback(name, deadline).await?,
+                    Local::Missing => {
+                        self.remaining_validity(expires_at)?;
+                        return Err(LookupError::NotFound.into());
+                    }
+                    Local::Found {
+                        entries,
+                        expires_at: expiry,
+                        ..
+                    } => {
+                        if let Some(expiry) = expiry {
+                            expires_at = Some(expires_at.map_or(expiry, |old| old.min(expiry)));
+                        }
+                        if let Some(target) = entries.iter().find_map(|entry| match &entry.value {
+                            Value::Cname(target) => Some(target),
+                            _ => None,
+                        }) {
+                            name = target.clone();
+                            continue;
+                        }
+                        entries
+                            .into_iter()
+                            .filter_map(|entry| match entry.value {
+                                Value::A(ip) => Some(IpAddr::V4(ip)),
+                                Value::Aaaa(ip) => Some(IpAddr::V6(ip)),
+                                Value::Cname(_) => None,
+                            })
+                            .collect()
+                    }
+                };
+                self.remaining_validity(expires_at)?;
+                strategy.select(&mut addresses);
+                let mut unique = HashSet::new();
+                addresses.retain(|ip| unique.insert(*ip));
+                ensure!(!addresses.is_empty(), LookupError::NoData);
+                return Ok(addresses);
+            }
+            bail!("CNAME chain exceeds 16 names")
+        })
+        .await
+        .context("DNS resolution timed out")?
+    }
+
+    async fn answer_inner(&self, request: Message, deadline: Option<Instant>) -> Result<Message> {
         ensure!(request.queries.len() == 1, "expected one question");
         let question = &request.queries[0];
         let mut name = question.name().to_lowercase();
@@ -88,11 +233,11 @@ impl Resolver {
         let mut expires_at: Option<u64> = None;
         for _ in 0..16 {
             ensure!(seen.insert(name.clone()), "CNAME loop");
-            match self.local(&name).await? {
+            match self.local(&name, deadline).await? {
                 Local::Forward => {
                     let mut forwarded = request.clone();
                     forwarded.queries = vec![Query::query(name, kind)];
-                    let mut result = self.upstream.exchange(forwarded).await?;
+                    let mut result = self.exchange(forwarded, deadline).await?;
                     result.metadata.id = request.metadata.id;
                     result.queries = request.queries.clone();
                     if !response.answers.is_empty() {
@@ -163,13 +308,7 @@ impl Resolver {
         synthesized_at: Option<Instant>,
         expires_at: Option<u64>,
     ) -> Result<Message> {
-        let remaining = if let Some(expiry) = expires_at {
-            let now = self.clock.now()?;
-            ensure!(now < expiry, "publication expired during resolution");
-            (expiry - now).min(u64::from(u32::MAX)) as u32
-        } else {
-            u32::MAX
-        };
+        let remaining = self.remaining_validity(expires_at)?;
         if let Some(started) = synthesized_at {
             // Conservatively age the local chain; newly received upstream records are untouched.
             let elapsed = started.elapsed().as_secs().min(u64::from(u32::MAX)) as u32;
@@ -180,15 +319,35 @@ impl Resolver {
         Ok(response)
     }
 
-    async fn local(&self, name: &Name) -> Result<Local> {
-        for zone in &self.config.hex_zones {
+    fn remaining_validity(&self, expires_at: Option<u64>) -> Result<u32> {
+        let Some(expiry) = expires_at else {
+            return Ok(u32::MAX);
+        };
+        let now = self.clock.now()?;
+        ensure!(now < expiry, "publication expired during resolution");
+        Ok((expiry - now).min(u64::from(u32::MAX)) as u32)
+    }
+
+    async fn exchange(&self, request: Message, deadline: Option<Instant>) -> Result<Message> {
+        match deadline {
+            Some(deadline) => {
+                self.upstream
+                    .exchange_with_deadline(request, deadline)
+                    .await
+            }
+            None => self.upstream.exchange(request).await,
+        }
+    }
+
+    async fn local(&self, name: &Name, deadline: Option<Instant>) -> Result<Local> {
+        for zone in self.policy.hex_zones() {
             if !zone.zone_of(name) {
                 continue;
             }
             if name == zone {
                 return Ok(Local::Found {
                     entries: Vec::new(),
-                    ttl: self.config.ttl,
+                    ttl: self.policy.ttl(),
                     expires_at: None,
                 });
             }
@@ -208,23 +367,23 @@ impl Resolver {
                     subdomain: String::new(),
                     value: Value::A(ip),
                 }],
-                ttl: self.config.ttl,
+                ttl: self.policy.ttl(),
                 expires_at: None,
             });
         }
-        let Some(discovery) = self.config.discovery_for(name) else {
+        let Some(discovery) = self.policy.discovery_for(name) else {
             return Ok(Local::Forward);
         };
         let parent = name.base_name();
         if discovery.domain.zone_of(&parent) {
             let label = name.iter().next().context("missing child label")?;
             let label = std::str::from_utf8(label).context("invalid child label")?;
-            if let Some(found) = self.entries(&parent, label, discovery).await? {
+            if let Some(found) = self.entries(&parent, label, discovery, deadline).await? {
                 return Ok(found);
             }
         }
         Ok(self
-            .entries(name, "", discovery)
+            .entries(name, "", discovery, deadline)
             .await?
             .unwrap_or(Local::Missing))
     }
@@ -234,8 +393,9 @@ impl Resolver {
         owner: &Name,
         subdomain: &str,
         discovery: &Discovery,
+        deadline: Option<Instant>,
     ) -> Result<Option<Local>> {
-        let cached = self.publication(owner, discovery).await?;
+        let cached = self.publication(owner, discovery, deadline).await?;
         let Some(publication) = cached.publication else {
             return Ok(None);
         };
@@ -257,7 +417,7 @@ impl Resolver {
             .as_secs();
         let remaining_validity = publication.expires_at - now;
         let ttl = cache_ttl
-            .min(u64::from(self.config.ttl))
+            .min(u64::from(self.policy.ttl()))
             .min(remaining_validity) as u32;
         Ok(Some(Local::Found {
             entries,
@@ -266,13 +426,18 @@ impl Resolver {
         }))
     }
 
-    async fn publication(&self, owner: &Name, discovery: &Discovery) -> Result<Cached> {
+    async fn publication(
+        &self,
+        owner: &Name,
+        discovery: &Discovery,
+        deadline: Option<Instant>,
+    ) -> Result<Cached> {
         let slot = {
             let mut cache = self.cache.lock().await;
             if let Some(slot) = cache.get(owner) {
                 slot.clone()
             } else {
-                if cache.len() >= self.config.cache_capacity
+                if cache.len() >= self.policy.cache_capacity()
                     && let Some(evicted) = cache.keys().next().cloned()
                 {
                     cache.remove(&evicted);
@@ -304,10 +469,10 @@ impl Resolver {
         let mut edns = Edns::new();
         edns.set_max_payload(1232);
         query.edns = Some(edns);
-        let answer = self.upstream.exchange(query).await?;
+        let answer = self.exchange(query, deadline).await?;
         let now = self.clock.now()?;
         let (publication, ttl) =
-            collect_publications(&answer, owner, discovery, now, self.config.ttl)?;
+            collect_publications(&answer, owner, discovery, now, self.policy.ttl())?;
         let cached = Cached {
             publication: publication.map(Arc::new),
             until: Instant::now() + Duration::from_secs(u64::from(ttl)),

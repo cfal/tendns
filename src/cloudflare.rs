@@ -11,8 +11,9 @@ use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{
-    config::{Config, Discovery},
+    config::Config,
     names::{canonical_name, canonical_wire},
+    policy::Discovery,
     protocol::{self, Entry, Publication, Value},
     resolver::{Clock, SystemClock, collect_publications},
 };
@@ -143,7 +144,7 @@ impl Cloudflare {
                 "validity must be at least one second"
             );
             ensure!(
-                config.ttl == 1 || (60..=86_400).contains(&config.ttl),
+                config.policy.ttl() == 1 || (60..=86_400).contains(&config.policy.ttl()),
                 "Cloudflare TTL must be 1 (Auto) or 60-86400 seconds"
             );
         }
@@ -183,7 +184,7 @@ impl Cloudflare {
                     &parent,
                     discovery,
                     SystemClock.now()?,
-                    config.ttl,
+                    config.policy.ttl(),
                 )
                 .context("parent TXT cannot currently resolve; repair it before using --direct")?;
                 let label = child_label(name)?;
@@ -236,7 +237,7 @@ impl Cloudflare {
                     .issued_at
                     .checked_add(valid_for.as_secs())
                     .context("expiry overflows timestamp")?;
-                config.ttl
+                config.policy.ttl()
             }
             Change::Remove { kind } => {
                 let before = publication.entries.len();

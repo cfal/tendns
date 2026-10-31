@@ -1,3 +1,5 @@
+#![cfg(feature = "cli")]
+
 #[path = "transport/doh.rs"]
 mod doh;
 
@@ -227,7 +229,7 @@ impl Exchange for LargeAnswer {
 #[tokio::test]
 async fn listeners_support_udp_tcp_edns_truncation_and_shutdown() {
     let config = Arc::new(Config::parse("hex_zones = ['hex.test']").unwrap());
-    let resolver = Arc::new(Resolver::new(config, Arc::new(LargeAnswer)));
+    let resolver = Arc::new(Resolver::new(config.policy.clone(), Arc::new(LargeAnswer)));
     let mut server = Server::new(Handler::new(resolver, 8, Duration::from_secs(2)));
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = localhost(listener.local_addr().unwrap().port());
@@ -331,7 +333,7 @@ async fn encrypted_txt_resolves_through_real_dns_listeners() {
                 value: Value::A("192.0.2.10".parse().unwrap()),
             }],
         },
-        &config.discovery[0].key,
+        &config.policy.discovery()[0].key,
         &canonical_name("example.com").unwrap(),
     )
     .unwrap();
@@ -358,7 +360,7 @@ async fn encrypted_txt_resolves_through_real_dns_listeners() {
             .unwrap();
     });
     let forwarder = Arc::new(Forwarder::new(&config.upstreams, Duration::from_secs(2)).unwrap());
-    let resolver = Arc::new(Resolver::new(config, forwarder));
+    let resolver = Arc::new(Resolver::new(config.policy.clone(), forwarder));
     let mut server = Server::new(Handler::new(resolver, 8, Duration::from_secs(3)));
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = localhost(listener.local_addr().unwrap().port());
@@ -436,7 +438,7 @@ async fn guarded_listener(
     request_timeout: Duration,
 ) -> (Server<Handler>, SocketAddr) {
     let config = Arc::new(Config::parse("").unwrap());
-    let resolver = Arc::new(Resolver::new(config, upstream));
+    let resolver = Arc::new(Resolver::new(config.policy.clone(), upstream));
     let mut server = Server::new(Handler::new(resolver, 1, request_timeout));
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = localhost(listener.local_addr().unwrap().port());

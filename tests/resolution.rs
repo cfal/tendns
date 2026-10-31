@@ -1,5 +1,7 @@
 #[path = "resolution/cache.rs"]
 mod cache;
+#[path = "resolution/lookup.rs"]
+mod lookup;
 
 use std::{
     collections::HashMap,
@@ -19,9 +21,9 @@ use hickory_proto::{
     },
 };
 use tendns::{
-    config::Config,
     names::canonical_name,
-    protocol::{Entry, Publication, Value, encrypt},
+    policy::{Discovery, Policy},
+    protocol::{Entry, Publication, Secret, Value, encrypt},
     resolver::{Clock, Resolver},
     upstream::Exchange,
 };
@@ -33,6 +35,7 @@ struct Mock {
     replies: Mutex<HashMap<(Name, RecordType), Message>>,
     calls: Mutex<Vec<(Name, RecordType)>>,
     gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    deadlines: Mutex<Vec<tokio::time::Instant>>,
 }
 
 impl Mock {
@@ -55,6 +58,15 @@ impl Mock {
 
 #[async_trait]
 impl Exchange for Mock {
+    async fn exchange_with_deadline(
+        &self,
+        query: Message,
+        deadline: tokio::time::Instant,
+    ) -> Result<Message> {
+        self.deadlines.lock().unwrap().push(deadline);
+        self.exchange(query).await
+    }
+
     async fn exchange(&self, query: Message) -> Result<Message> {
         let key = (
             query.queries[0].name().clone(),
@@ -81,11 +93,21 @@ impl Clock for FakeClock {
     }
 }
 
-fn config() -> Arc<Config> {
+fn discovery(domain: &str, key: &str) -> Discovery {
+    Discovery {
+        domain: canonical_name(domain).unwrap(),
+        key: Arc::new(Secret::decode(key).unwrap()),
+    }
+}
+
+fn config() -> Arc<Policy> {
     Arc::new(
-        Config::parse(&format!(
-            "hex_zones=['hex.test']\n[[discovery]]\ndomain='example.com'\nkey='{KEY}'"
-        ))
+        Policy::new(
+            vec![discovery("example.com", KEY)],
+            vec![canonical_name("hex.test").unwrap()],
+            60,
+            1024,
+        )
         .unwrap(),
     )
 }
@@ -119,7 +141,7 @@ fn publication(entries: Vec<Entry>, issued_at: u64) -> Publication {
     }
 }
 
-fn txt(config: &Config, owner: &str, publication: &Publication, ttl: u32) -> Record {
+fn txt(config: &Policy, owner: &str, publication: &Publication, ttl: u32) -> Record {
     let name = canonical_name(owner).unwrap();
     let encoded = encrypt(
         publication,
@@ -135,7 +157,7 @@ fn txt(config: &Config, owner: &str, publication: &Publication, ttl: u32) -> Rec
     )
 }
 
-fn setup() -> (Arc<Config>, Arc<Mock>, Arc<FakeClock>, Resolver) {
+fn setup() -> (Arc<Policy>, Arc<Mock>, Arc<FakeClock>, Resolver) {
     let config = config();
     let mock = Arc::new(Mock::default());
     let clock = Arc::new(FakeClock(AtomicU64::new(100)));
@@ -547,9 +569,18 @@ async fn hidden_children_do_not_make_their_parent_nxdomain() {
 
 #[tokio::test]
 async fn parent_search_stops_at_the_most_specific_configured_domain() {
-    let config = Arc::new(Config::parse(&format!(
-        "[[discovery]]\ndomain='example.com'\nkey='{KEY}'\n[[discovery]]\ndomain='inner.example.com'\nkey='{KEY}'"
-    )).unwrap());
+    let config = Arc::new(
+        Policy::new(
+            vec![
+                discovery("example.com", KEY),
+                discovery("inner.example.com", KEY),
+            ],
+            vec![],
+            60,
+            1024,
+        )
+        .unwrap(),
+    );
     let mock = Arc::new(Mock::default());
     let mut answer = reply();
     answer.answers.push(txt(
@@ -705,7 +736,7 @@ async fn txt_fragments_from_separate_records_are_never_concatenated() {
     let owner = canonical_name("example.com").unwrap();
     let value = encrypt(
         &publication(vec![entry("nas", "192.0.2.1")], 100),
-        &config.discovery[0].key,
+        &config.discovery()[0].key,
         &owner,
     )
     .unwrap();

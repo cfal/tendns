@@ -1,7 +1,55 @@
 # tendns
 
-A Rust DNS forwarder with UDP/TCP and HTTP/HTTPS listeners, DoH upstreams, encrypted TXT
-discovery, and hexadecimal IPv4 names. Built on Hickory DNS.
+A Rust library and DNS forwarder for encrypted TXT discovery and hexadecimal IPv4
+names. The standalone binary supports UDP/TCP and HTTP/HTTPS listeners and DoH
+upstreams. Built on Hickory DNS. Licensed under MIT.
+
+## Library
+
+```toml
+[dependencies]
+tendns = { version = "0.2", default-features = false }
+```
+
+The library-only build contains the protocol, validated `Policy`, `Resolver`, and
+`Exchange` transport interface. It does not include the CLI, TOML parser, DNS/HTTP
+servers, Cloudflare client, or built-in network forwarder. The default `cli`
+feature enables all standalone functionality, including `cargo install tendns`.
+
+Construct a `Policy` from `Discovery` domain/key pairs, hex zones, a TTL cap, and a
+publication-cache capacity. Domain canonicalization, overlap validation, and
+most-specific key selection are shared with the standalone server. Configuration
+formats and secret storage remain the embedding application's responsibility.
+See the [API documentation](https://docs.rs/tendns) for a construction example.
+
+Implement `Exchange` using your existing raw DNS transport, then create a resolver
+with `Resolver::new(Arc<Policy>, Arc<dyn Exchange>)`. The transport must validate
+response association and perform UDP truncation fallback. Internal TXT fetches
+must bypass the tendns wrapper to avoid recursion. Create one resolver per
+upstream policy: do not share cached publications between split-horizon upstreams.
+
+- `Policy::claims` identifies protected/hex names before choosing local versus
+  ordinary native resolution. Unrelated names need not change their OS/NSS path.
+- `Resolver::answer_with_deadline` answers DNS messages using one absolute Tokio
+  deadline across cache waits, parent/direct lookups, and CNAME following. The
+  same deadline reaches `Exchange::exchange_with_deadline`; override that method
+  when the underlying transport already supports deadlines. Packet-serving
+  callers should use `resolver::validate_request` first.
+- `Resolver::lookup_ip` follows private CNAMEs and selects address families using
+  `IpStrategy`. Its async fallback receives only an unprotected name and the same
+  deadline, so the application can preserve its native resolver. Private misses,
+  authentication failures, and expired publications never invoke that fallback.
+  Expiry is checked again after a public CNAME target resolves. `LookupError`
+  distinguishes NXDOMAIN-like `NotFound` from family-specific `NoData` results.
+
+Do not wrap address results in a fixed-lifetime cache: it could outlive authenticated
+expiry. The resolver already caches publications with TTL/expiry checks. Recreate
+the policy/resolver when keys change. Admission limits and destination filtering
+(such as rejecting fake-IP ranges) belong to the embedding application.
+
+The Rust library API changed in 0.2: `Resolver::new` takes `Arc<Policy>` instead of
+the server's `Arc<Config>`. Standalone TOML, CLI commands, and the `td1` wire format
+are unchanged.
 
 ## Build and run
 

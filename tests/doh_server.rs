@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "cli"))]
 
 use std::{net::Ipv4Addr, process::Stdio, time::Duration};
 

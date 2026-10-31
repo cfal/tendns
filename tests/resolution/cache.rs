@@ -317,9 +317,18 @@ async fn zero_ttl_and_unproven_negative_answers_are_not_cached() {
 #[tokio::test]
 async fn cache_eviction_refetches_without_cross_domain_key_reuse() {
     let other_key = tendns::protocol::Secret::generate().unwrap();
-    let config = Arc::new(Config::parse(&format!(
-        "cache_capacity=1\n[[discovery]]\ndomain='example.com'\nkey='{KEY}'\n[[discovery]]\ndomain='inner.example.com'\nkey='{other_key}'"
-    )).unwrap());
+    let config = Arc::new(
+        Policy::new(
+            vec![
+                discovery("example.com", KEY),
+                discovery("inner.example.com", &other_key),
+            ],
+            vec![],
+            60,
+            1,
+        )
+        .unwrap(),
+    );
     let mock = Arc::new(Mock::default());
     for (owner, ip) in [
         ("example.com", "192.0.2.1"),

@@ -46,8 +46,13 @@ impl Handler {
         let Ok(_permit) = self.permits.try_acquire() else {
             return local_response(&message, ResponseCode::ServFail);
         };
-        match tokio::time::timeout(self.timeout, self.resolver.answer(message.clone())).await {
-            Ok(Ok(response)) => response,
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        match self
+            .resolver
+            .answer_with_deadline(message.clone(), deadline)
+            .await
+        {
+            Ok(response) => response,
             _ => local_response(&message, ResponseCode::ServFail),
         }
     }
@@ -105,7 +110,7 @@ impl RequestHandler for Handler {
 pub async fn serve(config: Config) -> Result<()> {
     let config = Arc::new(config);
     let upstream = Arc::new(Forwarder::new(&config.upstreams, config.upstream_timeout)?);
-    let resolver = Arc::new(Resolver::new(config.clone(), upstream));
+    let resolver = Arc::new(Resolver::new(config.policy.clone(), upstream));
     let handler = Handler::new(resolver, config.max_inflight, config.request_timeout);
     let mut server = Server::new(handler.clone());
     // Bind everything before starting listeners, so a partial startup is not advertised.

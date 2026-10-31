@@ -12,18 +12,19 @@ use serde::{Deserialize, Deserializer};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::{names::canonical_name, protocol::Secret};
+use crate::{
+    names::canonical_name,
+    policy::{Discovery, Policy},
+    protocol::Secret,
+};
 
 pub struct Config {
     pub listeners: Vec<Listener>,
     pub upstreams: Vec<Upstream>,
-    pub discovery: Vec<Discovery>,
-    pub hex_zones: Vec<Name>,
-    pub ttl: u32,
+    pub policy: Arc<Policy>,
     pub valid_for: Duration,
     pub upstream_timeout: Duration,
     pub request_timeout: Duration,
-    pub cache_capacity: usize,
     pub max_inflight: usize,
 }
 
@@ -72,12 +73,6 @@ fn secret_tokens<'de, D: Deserializer<'de>>(
         .into_iter()
         .map(Zeroizing::new)
         .collect())
-}
-
-#[derive(Clone)]
-pub struct Discovery {
-    pub domain: Name,
-    pub key: Arc<Secret>,
 }
 
 #[derive(Clone, Debug)]
@@ -235,11 +230,6 @@ impl Config {
                 );
             }
         }
-        ensure!(raw.ttl > 0, "ttl must be positive");
-        ensure!(
-            raw.cache_capacity > 0 && raw.cache_capacity <= 65_536,
-            "cache_capacity must be 1-65536"
-        );
         ensure!(
             raw.max_inflight > 0 && raw.max_inflight <= 65_536,
             "max_inflight must be 1-65536"
@@ -248,33 +238,22 @@ impl Config {
         for item in raw.discovery {
             let key = Zeroizing::new(item.key);
             let domain = canonical_name(&item.domain).context("invalid discovery domain")?;
-            ensure!(
-                !discovery.iter().any(|d| d.domain == domain),
-                "duplicate discovery domain"
-            );
             discovery.push(Discovery {
                 domain,
                 key: Arc::new(Secret::decode(&key)?),
             });
         }
-        discovery.sort_by_key(|d| std::cmp::Reverse(d.domain.num_labels()));
         let mut hex_zones: Vec<Name> = Vec::new();
         for item in raw.hex_zones {
             let domain = canonical_name(&item).context("invalid hex zone")?;
-            ensure!(
-                !hex_zones
-                    .iter()
-                    .any(|d| d.zone_of(&domain) || domain.zone_of(d)),
-                "hex zones must not overlap"
-            );
-            ensure!(
-                !discovery
-                    .iter()
-                    .any(|d| d.domain.zone_of(&domain) || domain.zone_of(&d.domain)),
-                "hex and discovery domains must not overlap"
-            );
             hex_zones.push(domain);
         }
+        let policy = Arc::new(Policy::new(
+            discovery,
+            hex_zones,
+            raw.ttl,
+            raw.cache_capacity,
+        )?);
         let mut upstreams = Vec::new();
         for item in raw.upstreams {
             upstreams.push(match item {
@@ -317,19 +296,16 @@ impl Config {
         Ok(Self {
             listeners: raw.listeners,
             upstreams,
-            discovery,
-            hex_zones,
-            ttl: raw.ttl,
+            policy,
             valid_for: duration(&raw.valid_for, "valid_for")?,
             upstream_timeout: duration(&raw.upstream_timeout, "upstream_timeout")?,
             request_timeout: duration(&raw.request_timeout, "request_timeout")?,
-            cache_capacity: raw.cache_capacity,
             max_inflight: raw.max_inflight,
         })
     }
 
     pub fn discovery_for(&self, name: &Name) -> Option<&Discovery> {
-        self.discovery.iter().find(|d| d.domain.zone_of(name))
+        self.policy.discovery_for(name)
     }
 }
 

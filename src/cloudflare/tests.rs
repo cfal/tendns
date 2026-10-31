@@ -351,7 +351,7 @@ async fn appends_to_existing_array_and_replaces_only_selected_hostname_and_type(
         assert!(
             protocol::decrypt(
                 &txt_bytes(data["content"].as_str().unwrap()).unwrap(),
-                &config.discovery[0].key,
+                &config.policy.discovery()[0].key,
                 &canonical_name("example.com").unwrap(),
                 200
             )
