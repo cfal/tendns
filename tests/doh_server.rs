@@ -678,6 +678,42 @@ async fn doh_rejects_bad_http_requests_and_limits_body_reads() {
 }
 
 #[tokio::test]
+async fn excessive_request_timeout_is_rejected_before_doh_startup() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("config.toml");
+    for settings in [
+        "type='http'",
+        "type='https'\ncert='server.crt'\nkey='server.key'",
+    ] {
+        let reserved = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        std::fs::write(
+            &path,
+            format!("request_timeout='18446744073709551615s'\n[[listeners]]\naddress='0.0.0.0:{port}'\n{settings}\n[[upstreams]]\ntype='plain'\naddress='192.0.2.1:53'"),
+        )
+        .unwrap();
+        let result = timeout(
+            DEADLINE,
+            command().arg("--config").arg(&path).arg("serve").output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!result.status.success());
+        let error = String::from_utf8(result.stderr).unwrap();
+        assert!(
+            error.contains("request_timeout must not exceed 24h"),
+            "{error}"
+        );
+        assert!(!error.contains("listening on"));
+        let _available = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port))
+            .await
+            .unwrap();
+    }
+}
+
+#[tokio::test]
 async fn bad_startup_credentials_never_advertise_a_listener_or_leak_tokens() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("config.toml");

@@ -448,14 +448,13 @@ async fn guarded_listener(
 
 #[tokio::test]
 async fn unrepresentable_handler_deadline_does_not_panic() {
-    let config = Config::parse("request_timeout = '18446744073709551615s'").unwrap();
+    let request_timeout = Duration::from_secs(u64::MAX);
     assert!(
         tokio::time::Instant::now()
-            .checked_add(config.request_timeout)
+            .checked_add(request_timeout)
             .is_none()
     );
-    let (mut server, address) =
-        guarded_listener(Arc::new(LargeAnswer), config.request_timeout).await;
+    let (mut server, address) = guarded_listener(Arc::new(LargeAnswer), request_timeout).await;
     let mut stream = TcpStream::connect(address).await.unwrap();
     tcp_write(&mut stream, &query("large.test", RecordType::TXT)).await;
     let result = tcp_read(&mut stream).await;

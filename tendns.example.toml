@@ -1,7 +1,7 @@
 ttl = 60
 valid_for = "24h"
 upstream_timeout = "3s"
-request_timeout = "10s"
+request_timeout = "10s" # 1s-24h, including HTTP header/body and keep-alive timers.
 cache_capacity = 1024
 max_inflight = 256
 hex_zones = ["hex.example.net"]

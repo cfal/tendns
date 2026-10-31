@@ -168,7 +168,7 @@ curl --cacert server.crt \
 
 Responses use `Cache-Control: no-store` to avoid shared HTTP caches retaining
 private answers; DNS TTLs still apply. Request URIs are limited to 8 KiB, binary
-POST bodies to 65535 bytes, and body reads to `request_timeout`. HTTP connections
+POST bodies to 65535 bytes, and body reads to `request_timeout` (1s-24h). HTTP connections
 and in-flight HTTP requests are each bounded by `max_inflight` per listener.
 Connections are rotated after five minutes, with a short graceful-close window.
 No CORS access or client-subnet parameter support is enabled.

@@ -293,13 +293,18 @@ impl Config {
                 }
             });
         }
+        let request_timeout = duration(&raw.request_timeout, "request_timeout")?;
+        ensure!(
+            request_timeout <= Duration::from_secs(86_400),
+            "request_timeout must not exceed 24h"
+        );
         Ok(Self {
             listeners: raw.listeners,
             upstreams,
             policy,
             valid_for: duration(&raw.valid_for, "valid_for")?,
             upstream_timeout: duration(&raw.upstream_timeout, "upstream_timeout")?,
-            request_timeout: duration(&raw.request_timeout, "request_timeout")?,
+            request_timeout,
             max_inflight: raw.max_inflight,
         })
     }
@@ -320,6 +325,20 @@ fn duration(value: &str, name: &str) -> Result<Duration> {
 mod tests {
     use super::*;
     const KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+
+    #[test]
+    fn request_timeout_has_bounds_safe_for_all_listener_timers() {
+        for (value, seconds) in [("1s", 1), ("24h", 86_400)] {
+            let config = Config::parse(&format!("request_timeout='{value}'")).unwrap();
+            assert_eq!(config.request_timeout, Duration::from_secs(seconds));
+        }
+        for value in ["86401s", "18446744073709551615s"] {
+            let error = Config::parse(&format!("request_timeout='{value}'"))
+                .err()
+                .expect("excessive request timeout accepted");
+            assert_eq!(error.to_string(), "request_timeout must not exceed 24h");
+        }
+    }
 
     #[test]
     fn listener_config_is_typed_and_resolves_paths_relative_to_toml() {
