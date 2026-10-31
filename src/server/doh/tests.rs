@@ -243,6 +243,7 @@ async fn http_uses_the_existing_resolver_without_udp_truncation_or_auth_bypass()
     );
     let bound = BoundListener::bind(&Listener::Http {
         address: "0.0.0.0:0".parse().unwrap(),
+        path: "/dns-query".into(),
         auth_tokens: vec![Zeroizing::new("test-token".to_owned())],
         auth_token_file: None,
     })
@@ -256,7 +257,7 @@ async fn http_uses_the_existing_resolver_without_udp_truncation_or_auth_bypass()
     let task = tokio::spawn(bound.run(handler, 8, Duration::from_secs(2), receiver));
     let client = reqwest::Client::builder()
         .no_proxy()
-        .http2_prior_knowledge()
+        .http1_only()
         .timeout(Duration::from_secs(5))
         .build()
         .unwrap();
@@ -283,7 +284,7 @@ async fn http_uses_the_existing_resolver_without_udp_truncation_or_auth_bypass()
         .send()
         .await
         .unwrap();
-    assert_eq!(response.version(), http::Version::HTTP_2);
+    assert_eq!(response.version(), http::Version::HTTP_11);
     let json: Value = response.json().await.unwrap();
     assert_eq!(json["Answer"][0]["TTL"], 42);
     assert!(json["Answer"][0]["data"].as_str().unwrap().len() > 1200);

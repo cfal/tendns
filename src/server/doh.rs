@@ -39,13 +39,21 @@ type HttpResponse = Response<Full<Bytes>>;
 pub(super) struct BoundListener {
     socket: TcpListener,
     tls: Option<TlsAcceptor>,
-    auth: Arc<Auth>,
+    options: Arc<HttpOptions>,
+}
+
+struct HttpOptions {
+    path: String,
+    http2: bool,
+    auth: Auth,
 }
 
 impl BoundListener {
     pub(super) async fn bind(config: &Listener) -> Result<Self> {
-        let (auth_tokens, auth_token_file, tls) = match config {
+        let (path, http2, auth_tokens, auth_token_file, tls) = match config {
             Listener::Https {
+                path,
+                http2,
                 cert,
                 key,
                 auth_tokens,
@@ -62,29 +70,43 @@ impl BoundListener {
                     .with_no_client_auth()
                     .with_single_cert(certificates, key)
                     .context("invalid HTTPS certificate/key pair")?;
-                tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+                tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+                if *http2 {
+                    tls.alpn_protocols.insert(0, b"h2".to_vec());
+                }
                 (
+                    path,
+                    *http2,
                     auth_tokens,
                     auth_token_file,
                     Some(TlsAcceptor::from(Arc::new(tls))),
                 )
             }
             Listener::Http {
+                path,
                 auth_tokens,
                 auth_token_file,
                 ..
-            } => (auth_tokens, auth_token_file, None),
+            } => (path, false, auth_tokens, auth_token_file, None),
             Listener::Dns { .. } => unreachable!("HTTP listeners only"),
         };
-        let auth = Arc::new(Auth::load(auth_tokens, auth_token_file.as_deref())?);
+        let options = Arc::new(HttpOptions {
+            path: path.clone(),
+            http2,
+            auth: Auth::load(auth_tokens, auth_token_file.as_deref())?,
+        });
         let socket = TcpListener::bind(config.address())
             .await
             .context("cannot bind DoH listener")?;
-        Ok(Self { socket, tls, auth })
+        Ok(Self {
+            socket,
+            tls,
+            options,
+        })
     }
 
     pub(super) fn unauthenticated(&self) -> bool {
-        self.auth.0.is_empty()
+        self.options.auth.0.is_empty()
     }
 
     pub(super) async fn run(
@@ -120,7 +142,7 @@ impl BoundListener {
                     let Ok(permit) = connections.clone().try_acquire_owned() else { continue; };
                     let tls = self.tls.clone();
                     let handler = handler.clone();
-                    let auth = self.auth.clone();
+                    let options = self.options.clone();
                     let requests = requests.clone();
                     let mut shutdown = shutdown.clone();
                     tasks.spawn(async move {
@@ -131,10 +153,10 @@ impl BoundListener {
                                 result = tokio::time::timeout(timeout, tls.accept(socket)) => result,
                             };
                             if let Ok(Ok(stream)) = handshake {
-                                connection(stream, handler, auth, requests, timeout, shutdown).await;
+                                connection(stream, handler, options, requests, timeout, shutdown).await;
                             }
                         } else {
-                            connection(socket, handler, auth, requests, timeout, shutdown).await;
+                            connection(socket, handler, options, requests, timeout, shutdown).await;
                         }
                     });
                 }
@@ -152,26 +174,30 @@ impl BoundListener {
 async fn connection<S>(
     stream: S,
     handler: Handler,
-    auth: Arc<Auth>,
+    options: Arc<HttpOptions>,
     permits: Arc<Semaphore>,
     timeout: Duration,
     mut shutdown: watch::Receiver<bool>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let http2 = options.http2;
     let service = service_fn(move |request| {
         let handler = handler.clone();
-        let auth = auth.clone();
+        let options = options.clone();
         let permits = permits.clone();
         async move {
             let response = match permits.try_acquire_owned() {
-                Ok(_permit) => respond(request, &handler, &auth, timeout).await,
+                Ok(_permit) => respond(request, &handler, &options, timeout).await,
                 Err(_) => error(StatusCode::SERVICE_UNAVAILABLE),
             };
             Ok::<_, Infallible>(response)
         }
     });
     let mut builder = auto::Builder::new(TokioExecutor::new());
+    if !http2 {
+        builder = builder.http1_only();
+    }
     builder
         .http1()
         .timer(TokioTimer::new())
@@ -282,10 +308,10 @@ fn valid_token(token: &str) -> bool {
 async fn respond(
     request: Request<Incoming>,
     handler: &Handler,
-    auth: &Auth,
+    options: &HttpOptions,
     timeout: Duration,
 ) -> HttpResponse {
-    if !auth.accepts(request.headers()) {
+    if !options.auth.accepts(request.headers()) {
         let mut response = error(StatusCode::UNAUTHORIZED);
         response.headers_mut().insert(
             header::WWW_AUTHENTICATE,
@@ -293,7 +319,7 @@ async fn respond(
         );
         return response;
     }
-    match query(request, timeout).await {
+    match query(request, &options.path, timeout).await {
         Ok((message, format)) => {
             let answer = handler.resolve(message).await;
             let bytes = match format {
@@ -328,9 +354,10 @@ impl Format {
 
 async fn query(
     request: Request<Incoming>,
+    path: &str,
     timeout: Duration,
 ) -> Result<(Message, Format), StatusCode> {
-    if request.uri().path() != "/dns-query" {
+    if request.uri().path() != path {
         return Err(StatusCode::NOT_FOUND);
     }
     if request.uri().to_string().len() > MAX_URI {

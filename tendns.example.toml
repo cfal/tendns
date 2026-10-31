@@ -14,12 +14,15 @@ address = "0.0.0.0:5300"
 # [[listeners]]
 # type = "http"
 # address = "0.0.0.0:8053"
+# path = "/dns-query"
 # auth_tokens = ["REPLACE_WITH_A_GENERATED_TOKEN"]
 
-# Paths are relative to this TOML file. Credentials load once; restart to rotate.
+# Credential file paths are relative to this TOML file; restart to rotate.
 # [[listeners]]
 # type = "https"
 # address = "0.0.0.0:8443"
+# path = "/dns-query"
+# http2 = true
 # cert = "server.crt"
 # key = "server.key"
 # auth_tokens = ["REPLACE_WITH_A_GENERATED_TOKEN"]

@@ -21,6 +21,7 @@ use tokio::{
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
+const PATHS: [&str; 3] = ["/plain/dns", "/secure/dns", "/dns-query"];
 
 fn command() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tendns"));
@@ -56,6 +57,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start() -> Self {
+        Self::start_with_https_http2(None).await
+    }
+
+    async fn start_with_https_http2(http2: Option<bool>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let mut reserved = Vec::new();
         let mut ports = Vec::new();
@@ -81,6 +86,7 @@ impl Fixture {
         )
         .unwrap();
         std::fs::write(directory.path().join("empty.txt"), "\n\r\n").unwrap();
+        let http2 = http2.map_or(String::new(), |enabled| format!("http2 = {enabled}"));
         std::fs::write(
             directory.path().join("config.toml"),
             format!(
@@ -90,11 +96,14 @@ impl Fixture {
             [[listeners]]
             type = "http"
             address = "0.0.0.0:{}"
+            path = "{http_path}"
             auth_tokens = ["inline-token"]
             auth_token_file = "tokens.txt"
             [[listeners]]
             type = "https"
             address = "0.0.0.0:{}"
+            path = "{https_path}"
+            {http2}
             cert = "server.crt"
             key = "server.key"
             auth_tokens = ["https-token"]
@@ -106,7 +115,11 @@ impl Fixture {
             type = "plain"
             address = "192.0.2.1:53"
         "#,
-                ports[0], ports[1], ports[2]
+                ports[0],
+                ports[1],
+                ports[2],
+                http_path = PATHS[0],
+                https_path = PATHS[1],
             ),
         )
         .unwrap();
@@ -143,6 +156,12 @@ impl Fixture {
             ports[2]
         )));
         assert!(!messages.contains("inline-token"));
+        for (listener, protocol) in ["HTTP", "HTTPS", "HTTP"].iter().enumerate() {
+            assert!(messages.contains(&format!(
+                "listening on 0.0.0.0:{} ({protocol}, {})",
+                ports[listener], PATHS[listener]
+            )));
+        }
         Self {
             process,
             directory,
@@ -158,7 +177,10 @@ impl Fixture {
         } else {
             ("http", "127.0.0.1")
         };
-        format!("{scheme}://{host}:{}/dns-query", self.ports[listener])
+        format!(
+            "{scheme}://{host}:{}{}",
+            self.ports[listener], PATHS[listener]
+        )
     }
 
     async fn stop(mut self) {
@@ -191,6 +213,86 @@ fn client() -> reqwest::ClientBuilder {
 }
 
 #[tokio::test]
+async fn doh_paths_match_exactly_and_are_independent_per_listener() {
+    let fixture = Fixture::start().await;
+    let http = client()
+        .add_root_certificate(fixture.cert.clone())
+        .build()
+        .unwrap();
+    for (listener, token) in [
+        (0, Some("inline-token")),
+        (1, Some("https-token")),
+        (2, None),
+    ] {
+        let endpoint = reqwest::Url::parse(&fixture.url(listener)).unwrap();
+        for path in [
+            "/dns-query",
+            "/plain/dns",
+            "/secure/dns",
+            "/plain/dns/",
+            "/secure/dns/",
+            "/plain/dns-extra",
+            "/PLAIN/dns",
+            "/SECURE/dns",
+            "/%70lain/dns",
+            "/%73ecure/dns",
+            "/dns%2Dquery",
+            "/",
+        ] {
+            let mut url = endpoint.clone();
+            url.set_path(path);
+            let mut request = http
+                .get(url.clone())
+                .query(&[("name", "c0000201.hex.test")]);
+            if let Some(token) = token {
+                request = request.bearer_auth(token);
+            }
+            let response = request.send().await.unwrap();
+            let expected = if path == PATHS[listener] {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(response.status(), expected, "{url}");
+        }
+    }
+    fixture.stop().await;
+}
+
+#[tokio::test]
+async fn https_http2_can_be_disabled_without_disabling_http1() {
+    let fixture = Fixture::start_with_https_http2(Some(false)).await;
+    let http = client()
+        .add_root_certificate(fixture.cert.clone())
+        .build()
+        .unwrap();
+    let response = http
+        .get(fixture.url(1))
+        .bearer_auth("https-token")
+        .query(&[("name", "c0000201.hex.test")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.version(), Version::HTTP_11);
+    let http2 = client()
+        .add_root_certificate(fixture.cert.clone())
+        .http2_prior_knowledge()
+        .build()
+        .unwrap();
+    assert!(
+        http2
+            .get(fixture.url(1))
+            .bearer_auth("https-token")
+            .query(&[("name", "c0000201.hex.test")])
+            .send()
+            .await
+            .is_err()
+    );
+    fixture.stop().await;
+}
+
+#[tokio::test]
 async fn doh_http_https_binary_json_auth_and_startup_only_credentials() {
     let fixture = Fixture::start().await;
     let http = client().http1_only().build().unwrap();
@@ -210,6 +312,7 @@ async fn doh_http_https_binary_json_auth_and_startup_only_credentials() {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.version(), Version::HTTP_11);
         assert_eq!(
             response.headers()["content-type"],
             "application/dns-message"
@@ -220,6 +323,15 @@ async fn doh_http_https_binary_json_auth_and_startup_only_credentials() {
         assert_eq!(answer.answers[0].data.to_string(), "192.0.2.1");
         assert!(!answer.metadata.authentic_data);
     }
+    let h2c = client().http2_prior_knowledge().build().unwrap();
+    assert!(
+        h2c.get(fixture.url(0))
+            .bearer_auth("inline-token")
+            .query(&[("name", "c0000201.hex.test")])
+            .send()
+            .await
+            .is_err()
+    );
     for listener in [0, 1] {
         let transport = if listener == 0 { &http } else { &https };
         for token in [

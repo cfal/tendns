@@ -34,7 +34,8 @@ cargo fmt --all -- --check
 - `process.rs` (Unix): generate a key and TXT with the CLI, resolve through the
   actual server process, shut down with SIGTERM, and clean up partial bind failures.
 - `doh_server.rs` (Unix): real HTTP/HTTPS listeners with binary GET/POST and JSON
-  GET, HTTP/1.1 and HTTP/2, per-listener inline/file bearer tokens, startup-only
+  GET, per-listener paths, HTTP/1.1, HTTPS HTTP/2 defaults/disablement, cleartext
+  HTTP/2 rejection, per-listener inline/file bearer tokens, startup-only
   credentials, TLS verification/plaintext rejection, malformed requests/body
   deadlines, file-descriptor exhaustion recovery, and mixed DNS/DoH shutdown.
 - `src/server/doh/tests.rs`: token parsing, authentication, content negotiation,

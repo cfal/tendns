@@ -35,12 +35,18 @@ pub enum Listener {
     },
     Http {
         address: SocketAddr,
+        #[serde(default = "default_query_path")]
+        path: String,
         #[serde(default, deserialize_with = "secret_tokens")]
         auth_tokens: Vec<Zeroizing<String>>,
         auth_token_file: Option<PathBuf>,
     },
     Https {
         address: SocketAddr,
+        #[serde(default = "default_query_path")]
+        path: String,
+        #[serde(default = "default_http2")]
+        http2: bool,
         cert: PathBuf,
         key: PathBuf,
         #[serde(default, deserialize_with = "secret_tokens")]
@@ -124,6 +130,12 @@ fn default_listeners() -> Vec<Listener> {
         address: "0.0.0.0:5300".parse().expect("literal address"),
     }]
 }
+fn default_query_path() -> String {
+    "/dns-query".into()
+}
+fn default_http2() -> bool {
+    true
+}
 fn default_ttl() -> u32 {
     60
 }
@@ -198,12 +210,23 @@ impl Config {
                 );
             }
             if let Listener::Http {
-                auth_token_file, ..
+                path,
+                auth_token_file,
+                ..
             }
             | Listener::Https {
-                auth_token_file, ..
+                path,
+                auth_token_file,
+                ..
             } = listener
             {
+                ensure!(
+                    path.starts_with('/')
+                        && path.parse::<http::uri::PathAndQuery>().is_ok_and(|parsed| {
+                            parsed.query().is_none() && parsed.as_str() == path
+                        }),
+                    "HTTP/HTTPS listener path must start with / and contain no query, fragment, or whitespace"
+                );
                 ensure!(
                     auth_token_file
                         .as_ref()
@@ -375,6 +398,10 @@ mod tests {
             "listeners=[]",
             "listeners=[{type='dns', address='0.0.0.0:53', auth_tokens=['secret']}]",
             "listeners=[{type='dns', address='0.0.0.0:53', auth_token_file='tokens'}]",
+            "listeners=[{type='dns', address='0.0.0.0:53', path='/dns-query'}]",
+            "listeners=[{type='dns', address='0.0.0.0:53', http2=true}]",
+            "listeners=[{type='http', address='0.0.0.0:80', http2=true}]",
+            "listeners=[{type='http', address='0.0.0.0:80', http2=false}]",
             "listeners=[{type='http', address='0.0.0.0:80', cert='cert'}]",
             "listeners=[{type='https', address='0.0.0.0:443', cert='cert'}]",
             "listeners=[{type='http', address='0.0.0.0:0'}]",
@@ -385,6 +412,58 @@ mod tests {
                 .err()
                 .expect("invalid listener config");
             assert!(!format!("{error:#}").contains("secret"));
+        }
+    }
+
+    #[test]
+    fn listener_paths_and_https_http2_have_validated_defaults_and_overrides() {
+        for kind in ["http", "https"] {
+            let mut base = format!("[[listeners]]\ntype='{kind}'\naddress='0.0.0.0:8443'\n");
+            if kind == "https" {
+                base.push_str("cert='server.crt'\nkey='server.key'\n");
+            }
+            let config = Config::parse(&base).unwrap();
+            match &config.listeners[0] {
+                Listener::Http { path, .. } => assert_eq!(path, "/dns-query"),
+                Listener::Https { path, http2, .. } => {
+                    assert_eq!(path, "/dns-query");
+                    assert!(*http2);
+                }
+                Listener::Dns { .. } => panic!("expected HTTP/HTTPS listener"),
+            }
+            for expected in ["/", "/private/resolve", "/dns-query/", "/dns%2Dquery"] {
+                let config = Config::parse(&format!("{base}path={expected:?}")).unwrap();
+                match &config.listeners[0] {
+                    Listener::Http { path, .. } | Listener::Https { path, .. } => {
+                        assert_eq!(path, expected);
+                    }
+                    Listener::Dns { .. } => panic!("expected HTTP/HTTPS listener"),
+                }
+            }
+            for path in [
+                "",
+                "dns-query",
+                "https://example.com/dns-query",
+                "/dns-query?name=example.com",
+                "/dns-query#fragment",
+                "/dns query",
+                "/dns\nquery",
+            ] {
+                assert!(
+                    Config::parse(&format!("{base}path={path:?}")).is_err(),
+                    "{kind}: {path:?}"
+                );
+            }
+            if kind == "https" {
+                for expected in [false, true] {
+                    let config = Config::parse(&format!("{base}http2={expected}")).unwrap();
+                    let Listener::Https { http2, .. } = &config.listeners[0] else {
+                        panic!("expected HTTPS listener");
+                    };
+                    assert_eq!(*http2, expected);
+                }
+                assert!(Config::parse(&format!("{base}http2='true'")).is_err());
+            }
         }
     }
 

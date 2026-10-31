@@ -45,11 +45,14 @@ address = "0.0.0.0:5300"
 [[listeners]]
 type = "http"
 address = "0.0.0.0:8053"
+path = "/dns-query"
 auth_tokens = ["replace-with-a-random-token"]
 
 [[listeners]]
 type = "https"
 address = "0.0.0.0:8443"
+path = "/dns-query"
+http2 = true
 cert = "server.crt"
 key = "server.key"
 auth_tokens = ["another-random-token"]
@@ -58,7 +61,7 @@ auth_token_file = "tokens.txt"
 
 HTTPS requires a PEM certificate chain and an unencrypted PEM private key
 (PKCS#8, PKCS#1, or SEC1). Certificates, keys, and token files load **once at
-startup**; restart to rotate them. Relative paths resolve beside the TOML file.
+startup**; restart to rotate them. Relative file paths resolve beside the TOML file.
 Invalid or unreadable configured files fail startup before listeners are advertised.
 
 Authentication is independent per HTTP/HTTPS listener. `auth_tokens` and
@@ -76,8 +79,16 @@ challenge. DNS listeners reject auth fields. Protect token files like private
 keys. Plain HTTP exposes queries, answers, and bearer tokens: use HTTPS outside
 trusted networks. Authentication does not make an HTTP connection encrypted.
 
-Both HTTP/1.1 and HTTP/2 use `/dns-query` and the existing resolver, cache, and
-global query concurrency/deadline limits:
+Each HTTP/HTTPS listener has an optional `path`, defaulting to `/dns-query`.
+For example, `path = "/private/resolve"` moves both binary and JSON queries to
+that endpoint. It must start with `/` and contain no query string, fragment, or
+whitespace. Matching is exact, case-sensitive, and does not decode percent escapes
+or redirect trailing slashes. DNS listeners reject `path`.
+
+Plain HTTP serves HTTP/1.1 only. HTTPS serves HTTP/1.1 and, by default, HTTP/2
+negotiated through ALPN. Set `http2 = false` on an HTTPS listener to disable
+HTTP/2; HTTP and DNS listeners reject this setting. All listeners share the
+existing resolver, cache, and global query concurrency/deadline limits:
 
 - **Binary (RFC 8484):** GET `?dns=BASE64URL` with an unpadded DNS wire message,
   or POST a DNS wire message with `Content-Type: application/dns-message`.

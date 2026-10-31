@@ -136,10 +136,10 @@ pub async fn serve(config: Config) -> Result<()> {
     let mut http_tasks = JoinSet::new();
     for (listener, bound) in http {
         let address = listener.address();
-        let protocol = if matches!(listener, Listener::Https { .. }) {
-            "HTTPS"
-        } else {
-            "HTTP"
+        let (protocol, path) = match listener {
+            Listener::Http { path, .. } => ("HTTP", path),
+            Listener::Https { path, .. } => ("HTTPS", path),
+            Listener::Dns { .. } => unreachable!("HTTP listeners only"),
         };
         if bound.unauthenticated() {
             eprintln!(
@@ -152,7 +152,7 @@ pub async fn serve(config: Config) -> Result<()> {
             config.request_timeout,
             receiver.clone(),
         ));
-        eprintln!("listening on {address} ({protocol}, /dns-query)");
+        eprintln!("listening on {address} ({protocol}, {path})");
     }
     for listener in &config.listeners {
         if let Listener::Dns { address } = listener {
