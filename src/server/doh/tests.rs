@@ -234,10 +234,10 @@ async fn http_uses_the_existing_resolver_without_udp_truncation_or_auth_bypass()
             Ok(response)
         }
     }
-    let config = Arc::new(Config::parse("").unwrap());
+    let config = Config::parse("").unwrap();
     let upstream = Arc::new(Upstream::default());
     let handler = Handler::new(
-        Arc::new(Resolver::new(config.policy.clone(), upstream.clone())),
+        Arc::new(Resolver::new(config.policy, upstream.clone())),
         8,
         Duration::from_secs(2),
     );

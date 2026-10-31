@@ -228,8 +228,8 @@ impl Exchange for LargeAnswer {
 
 #[tokio::test]
 async fn listeners_support_udp_tcp_edns_truncation_and_shutdown() {
-    let config = Arc::new(Config::parse("hex_zones = ['hex.test']").unwrap());
-    let resolver = Arc::new(Resolver::new(config.policy.clone(), Arc::new(LargeAnswer)));
+    let config = Config::parse("hex_zones = ['hex.test']").unwrap();
+    let resolver = Arc::new(Resolver::new(config.policy, Arc::new(LargeAnswer)));
     let mut server = Server::new(Handler::new(resolver, 8, Duration::from_secs(2)));
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = localhost(listener.local_addr().unwrap().port());
@@ -320,9 +320,9 @@ async fn listeners_support_udp_tcp_edns_truncation_and_shutdown() {
 async fn encrypted_txt_resolves_through_real_dns_listeners() {
     let upstream_socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
     let upstream_address = localhost(upstream_socket.local_addr().unwrap().port());
-    let config = Arc::new(Config::parse(&format!(
+    let config = Config::parse(&format!(
         "[[upstreams]]\ntype='plain'\naddress='{upstream_address}'\n[[discovery]]\ndomain='example.com'\nkey='BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc'"
-    )).unwrap());
+    )).unwrap();
     let now = SystemClock.now().unwrap();
     let value = encrypt(
         &Publication {
@@ -360,7 +360,7 @@ async fn encrypted_txt_resolves_through_real_dns_listeners() {
             .unwrap();
     });
     let forwarder = Arc::new(Forwarder::new(&config.upstreams, Duration::from_secs(2)).unwrap());
-    let resolver = Arc::new(Resolver::new(config.policy.clone(), forwarder));
+    let resolver = Arc::new(Resolver::new(config.policy, forwarder));
     let mut server = Server::new(Handler::new(resolver, 8, Duration::from_secs(3)));
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = localhost(listener.local_addr().unwrap().port());
@@ -437,8 +437,8 @@ async fn guarded_listener(
     upstream: Arc<dyn Exchange>,
     request_timeout: Duration,
 ) -> (Server<Handler>, SocketAddr) {
-    let config = Arc::new(Config::parse("").unwrap());
-    let resolver = Arc::new(Resolver::new(config.policy.clone(), upstream));
+    let config = Config::parse("").unwrap();
+    let resolver = Arc::new(Resolver::new(config.policy, upstream));
     let mut server = Server::new(Handler::new(resolver, 1, request_timeout));
     let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
     let address = localhost(listener.local_addr().unwrap().port());

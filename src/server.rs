@@ -55,10 +55,7 @@ impl Handler {
             // Match Tokio's duration-based timeout when the deadline cannot be represented.
             None => self.resolver.answer(message.clone()).await,
         };
-        match result {
-            Ok(response) => response,
-            _ => local_response(&message, ResponseCode::ServFail),
-        }
+        result.unwrap_or_else(|_| local_response(&message, ResponseCode::ServFail))
     }
 }
 
@@ -112,9 +109,8 @@ impl RequestHandler for Handler {
 }
 
 pub async fn serve(config: Config) -> Result<()> {
-    let config = Arc::new(config);
     let upstream = Arc::new(Forwarder::new(&config.upstreams, config.upstream_timeout)?);
-    let resolver = Arc::new(Resolver::new(config.policy.clone(), upstream));
+    let resolver = Arc::new(Resolver::new(config.policy, upstream));
     let handler = Handler::new(resolver, config.max_inflight, config.request_timeout);
     let mut server = Server::new(handler.clone());
     // Bind everything before starting listeners, so a partial startup is not advertised.
