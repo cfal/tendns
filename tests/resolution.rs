@@ -515,6 +515,24 @@ async fn programmatic_private_questions_normalize_relative_names() {
 }
 
 #[tokio::test]
+async fn unclaimed_programmatic_questions_keep_their_relative_name() {
+    let (_, mock, _, resolver) = setup();
+    let name = Name::from_ascii("External.Test").unwrap();
+    mock.replies
+        .lock()
+        .unwrap()
+        .insert((name.clone(), RecordType::A), reply());
+    let mut request = Message::query();
+    request
+        .queries
+        .push(Query::query(name.clone(), RecordType::A));
+    let result = resolver.answer(request).await.unwrap();
+    assert_eq!(mock.calls(), vec![("external.test".into(), RecordType::A)]);
+    assert_eq!(result.queries[0].name().to_ascii(), name.to_ascii());
+    assert!(!result.queries[0].name().is_fqdn());
+}
+
+#[tokio::test]
 async fn programmatic_hex_apex_is_nodata_even_without_a_trailing_dot() {
     let (_, mock, _, resolver) = setup();
     let mut request = Message::query();
