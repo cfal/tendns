@@ -69,6 +69,16 @@ jobs:
       - name: Run tests
         run: cargo test --all-targets --locked
 
+      - name: Verify library-only build and tests
+        run: |
+          cargo check --lib --no-default-features --locked
+          cargo clippy --all-targets --no-default-features --locked -- -D warnings
+          cargo test --all-targets --no-default-features --locked
+          cargo test --doc --no-default-features --locked
+
+      - name: Verify crate packaging
+        run: cargo package --locked
+
   build:
     name: Build ${{ matrix.target }}
     needs: verify
@@ -150,8 +160,8 @@ jobs:
             *musl*) file "target/$TARGET/release/tendns" | grep -E 'static.*linked' ;;
           esac
           mkdir -p package artifacts smoke
-          cp "target/$TARGET/release/tendns" README.md tendns.example.toml package/
-          tar -czf "artifacts/tendns-$TARGET.tar.gz" -C package tendns README.md tendns.example.toml
+          cp "target/$TARGET/release/tendns" README.md LICENSE tendns.example.toml package/
+          tar -czf "artifacts/tendns-$TARGET.tar.gz" -C package tendns README.md LICENSE tendns.example.toml
           tar -xzf "artifacts/tendns-$TARGET.tar.gz" -C smoke
 
       - name: Smoke-test packaged binary (cross/QEMU)
@@ -217,7 +227,7 @@ jobs:
           archives=(release-artifacts/tendns-*.tar.gz)
           test "${#archives[@]}" -eq 8
           for archive in "${archives[@]}"; do
-            tar -tzf "$archive" | sort | diff -u <(printf 'README.md\ntendns\ntendns.example.toml\n') -
+            tar -tzf "$archive" | sort | diff -u <(printf 'LICENSE\nREADME.md\ntendns\ntendns.example.toml\n') -
           done
           cd release-artifacts
           sha256sum tendns-*.tar.gz > SHA256SUMS

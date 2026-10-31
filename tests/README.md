@@ -4,12 +4,17 @@ Run the suite without public DNS or HTTPS dependencies:
 
 ```sh
 CARGO_BUILD_JOBS=1 cargo test --all-targets
+CARGO_BUILD_JOBS=1 cargo test --no-default-features --all-targets
+CARGO_BUILD_JOBS=1 cargo test --no-default-features --doc
 CARGO_BUILD_JOBS=1 cargo test --all-targets -- --test-threads=1
 CARGO_BUILD_JOBS=1 cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
 ## Coverage Map
+
+- `policy.rs`: format-independent namespace/limit validation, canonicalization,
+  suffix boundaries, and most-specific discovery-key selection.
 
 - Unit tests in `src/protocol.rs`: wire regression vector, authenticated round trips,
   wrong keys/AAD/owners, tampering, malformed plaintext, truncation of all entry
@@ -27,6 +32,10 @@ cargo fmt --all -- --check
   record boundaries/filtering, record-type semantics, CNAME limits, and hex names.
 - `resolution/cache.rs`: paused-clock TTL tests, actual overlapping fetches,
   cancellation, eviction, recovery, and expiry while a CNAME lookup is pending.
+- `resolution/lookup.rs`: embedded address resolution, family selection, native
+  fallback without private-name leakage, local CNAME chains, expiry after public
+  fallback, absolute-deadline propagation, and cache-waiter cancellation. These
+  tests and the protocol/resolution suites also run with default features disabled.
 - `request_policy.rs`: unsupported requests, TSIG refusal, flags, and EDNS limits.
 - `transport.rs` and `transport/doh.rs`: UDP/TCP framing and truncation, failover,
   TCP reconnection, DoH certificate/hostname and response checks, request deadlines,
