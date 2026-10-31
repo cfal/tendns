@@ -447,6 +447,28 @@ async fn guarded_listener(
 }
 
 #[tokio::test]
+async fn unrepresentable_handler_deadline_does_not_panic() {
+    let config = Config::parse("request_timeout = '18446744073709551615s'").unwrap();
+    assert!(
+        tokio::time::Instant::now()
+            .checked_add(config.request_timeout)
+            .is_none()
+    );
+    let (mut server, address) =
+        guarded_listener(Arc::new(LargeAnswer), config.request_timeout).await;
+    let mut stream = TcpStream::connect(address).await.unwrap();
+    tcp_write(&mut stream, &query("large.test", RecordType::TXT)).await;
+    let result = tcp_read(&mut stream).await;
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert!(!result.answers.is_empty());
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(3), server.shutdown_gracefully())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
 async fn overloaded_handler_rejects_only_excess_requests_and_recovers() {
     let (entered, mut calls) = tokio::sync::mpsc::unbounded_channel();
     let upstream = Arc::new(BlockedUpstream {

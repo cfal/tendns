@@ -46,12 +46,16 @@ impl Handler {
         let Ok(_permit) = self.permits.try_acquire() else {
             return local_response(&message, ResponseCode::ServFail);
         };
-        let deadline = tokio::time::Instant::now() + self.timeout;
-        match self
-            .resolver
-            .answer_with_deadline(message.clone(), deadline)
-            .await
-        {
+        let result = match tokio::time::Instant::now().checked_add(self.timeout) {
+            Some(deadline) => {
+                self.resolver
+                    .answer_with_deadline(message.clone(), deadline)
+                    .await
+            }
+            // Match Tokio's duration-based timeout when the deadline cannot be represented.
+            None => self.resolver.answer(message.clone()).await,
+        };
+        match result {
             Ok(response) => response,
             _ => local_response(&message, ResponseCode::ServFail),
         }
