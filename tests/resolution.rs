@@ -460,6 +460,76 @@ async fn cname_chain_loop_and_txt_indirection() {
 }
 
 #[tokio::test]
+async fn programmatic_private_questions_normalize_relative_names() {
+    let (config, mock, _, resolver) = setup();
+    let mut parent = reply();
+    parent.answers.push(txt(
+        &config,
+        "example.com",
+        &publication(vec![entry("nas", "192.0.2.1")], 100),
+        60,
+    ));
+    mock.set("example.com", RecordType::TXT, parent);
+    let mut direct = reply();
+    direct.answers.push(txt(
+        &config,
+        "direct.example.com",
+        &publication(vec![entry("", "192.0.2.1")], 100),
+        60,
+    ));
+    mock.set("direct.example.com", RecordType::TXT, direct);
+    for owner in ["NAS.EXAMPLE.COM", "DIRECT.EXAMPLE.COM"] {
+        for with_deadline in [false, true] {
+            let mut request = Message::query();
+            request.queries.push(Query::query(
+                Name::from_ascii(owner).unwrap(),
+                RecordType::A,
+            ));
+            let result = if with_deadline {
+                resolver
+                    .answer_with_deadline(
+                        request.clone(),
+                        tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+                    )
+                    .await
+            } else {
+                resolver.answer(request.clone()).await
+            }
+            .unwrap();
+            assert_eq!(result.queries, request.queries);
+            assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+            assert_eq!(result.answers[0].name, canonical_name(owner).unwrap());
+            assert_eq!(
+                result.answers[0].data,
+                RData::A(A("192.0.2.1".parse().unwrap()))
+            );
+        }
+    }
+    assert_eq!(
+        mock.calls(),
+        vec![
+            ("example.com.".into(), RecordType::TXT),
+            ("direct.example.com.".into(), RecordType::TXT),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn programmatic_hex_apex_is_nodata_even_without_a_trailing_dot() {
+    let (_, mock, _, resolver) = setup();
+    let mut request = Message::query();
+    request.queries.push(Query::query(
+        Name::from_ascii("HeX.TeSt").unwrap(),
+        RecordType::A,
+    ));
+    let result = resolver.answer(request.clone()).await.unwrap();
+    assert_eq!(result.metadata.response_code, ResponseCode::NoError);
+    assert!(result.answers.is_empty());
+    assert_eq!(result.queries, request.queries);
+    assert!(mock.calls().is_empty());
+}
+
+#[tokio::test]
 async fn hex_synthesis_is_exact_and_never_calls_upstream() {
     let (_, mock, _, resolver) = setup();
     for (hex, address) in [

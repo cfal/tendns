@@ -29,18 +29,26 @@ must bypass the tendns wrapper to avoid recursion. Create one resolver per
 upstream policy: do not share cached publications between split-horizon upstreams.
 
 - `Policy::claims` identifies protected/hex names before choosing local versus
-  ordinary native resolution. Unrelated names need not change their OS/NSS path.
+  ordinary native resolution. It checks only the supplied name, without expanding
+  search domains or NSS aliases. Unrelated names need not change their OS/NSS path.
 - `Resolver::answer_with_deadline` answers DNS messages using one absolute Tokio
   deadline across cache waits, parent/direct lookups, and CNAME following. The
   same deadline reaches `Exchange::exchange_with_deadline`; override that method
   when the underlying transport already supports deadlines. Packet-serving
   callers should use `resolver::validate_request` first.
 - `Resolver::lookup_ip` follows private CNAMEs and selects address families using
-  `IpStrategy`. Its async fallback receives only an unprotected name and the same
-  deadline, so the application can preserve its native resolver. Private misses,
-  authentication failures, and expired publications never invoke that fallback.
+  `IpStrategy`. Its async fallback receives only names outside the configured
+  namespaces and the same deadline, preserving the application's native resolver.
+  Private misses, authentication failures, and expired publications never invoke
+  that fallback.
   Expiry is checked again after a public CNAME target resolves. `LookupError`
   distinguishes NXDOMAIN-like `NotFound` from family-specific `NoData` results.
+
+For strict namespace protection, pass absolute names and prevent the fallback
+from searching or aliasing into protected namespaces. Unclaimed relative names
+are passed through unchanged: a native search list could expand `nas` into
+`nas.example.com` and resolve it outside tendns. Native NSS alias expansion is
+likewise opaque to the library.
 
 Do not wrap address results in a fixed-lifetime cache: it could outlive authenticated
 expiry. The resolver already caches publications with TTL/expiry checks. Recreate
@@ -169,12 +177,12 @@ No CORS access or client-subnet parameter support is enabled.
 
 The `release-*` branch builds and tests the same source as the `v*` release tag.
 Dependencies use broad manifest constraints; `Cargo.lock` fixes the exact
-release graph, and CI builds with `--locked`. Releases are distributed through
-GitHub, not crates.io.
+release graph, and CI builds with `--locked`. Binary releases are distributed
+through GitHub; the library and installable CLI are packaged for crates.io.
 
 The release workflow packages and smoke-tests eight binaries: Linux x86_64
 (GNU and musl), Linux aarch64 (GNU and musl), Linux armv7 (GNU and musl), and
-macOS x86_64 and aarch64. Each archive contains `tendns`, this README, and
+macOS x86_64 and aarch64. Each archive contains `tendns`, this README, `LICENSE`, and
 `tendns.example.toml`; the release includes `SHA256SUMS` and build-provenance
 attestations. A tag creates a draft release after all builds pass. The draft is
 published only after reviewing the artifacts.

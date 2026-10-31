@@ -76,6 +76,9 @@ impl Policy {
     }
 
     /// Whether a name belongs to a private or hexadecimal namespace.
+    ///
+    /// Checks only the supplied labels; it does not expand search domains or NSS
+    /// aliases. Use absolute names when this check determines a security boundary.
     pub fn claims(&self, name: &Name) -> bool {
         self.discovery_for(name).is_some() || self.hex_zones.iter().any(|zone| zone.zone_of(name))
     }

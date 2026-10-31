@@ -272,6 +272,55 @@ async fn missing_invalid_and_expired_publications_never_fall_back() {
 }
 
 #[tokio::test]
+async fn invalid_hex_names_and_missing_families_never_fall_back() {
+    let (_, mock, _, resolver) = setup();
+    for (name, strategy, expected) in [
+        (
+            "zzzzzzzz.hex.test",
+            IpStrategy::Ipv4Only,
+            LookupError::NotFound,
+        ),
+        (
+            "0000000.hex.test",
+            IpStrategy::Ipv4Only,
+            LookupError::NotFound,
+        ),
+        (
+            "000000000.hex.test",
+            IpStrategy::Ipv4Only,
+            LookupError::NotFound,
+        ),
+        (
+            "a.c0000201.hex.test",
+            IpStrategy::Ipv4Only,
+            LookupError::NotFound,
+        ),
+        ("hex.test", IpStrategy::Ipv4Only, LookupError::NoData),
+        (
+            "c0000201.hex.test",
+            IpStrategy::Ipv6Only,
+            LookupError::NoData,
+        ),
+    ] {
+        let error = resolver
+            .lookup_ip(
+                canonical_name(name).unwrap(),
+                strategy,
+                deadline(),
+                no_fallback,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<LookupError>(),
+            Some(&expected),
+            "{name}"
+        );
+    }
+    assert!(mock.calls().is_empty());
+}
+
+#[tokio::test]
 async fn local_cname_loops_and_depth_limits_are_enforced_for_address_lookups() {
     for count in [1, 17] {
         let (config, mock, _, resolver) = setup();

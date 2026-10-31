@@ -154,6 +154,12 @@ impl Resolver {
     /// The fallback is never called for a missing or invalid private name. It
     /// receives the original absolute deadline and can preserve native OS/NSS
     /// behavior. Private chain expiry is checked again after the fallback returns.
+    ///
+    /// For strict namespace protection, pass absolute names and prevent fallback
+    /// search/alias expansion into protected namespaces. Unclaimed relative names
+    /// are passed through unchanged; native search lists and NSS aliases are
+    /// opaque to this resolver and may resolve such names outside tendns.
+    ///
     /// Do not cache the returned addresses with a fixed lifetime: the resolver's
     /// own publication cache already enforces TTL and authenticated expiry.
     pub async fn lookup_ip<F, Fut>(
@@ -226,6 +232,9 @@ impl Resolver {
         ensure!(request.queries.len() == 1, "expected one question");
         let question = &request.queries[0];
         let mut name = question.name().to_lowercase();
+        if self.policy.claims(&name) {
+            name.set_fqdn(true);
+        }
         let kind = question.query_type();
         let mut seen = HashSet::new();
         let mut response = local_response(&request, ResponseCode::NoError);
