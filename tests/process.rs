@@ -47,7 +47,7 @@ async fn generated_key_and_txt_work_through_the_server_process_and_sigterm() {
         .await
         .unwrap();
     std::fs::write(&config_path, format!(
-        "listen=['0.0.0.0:{port}']\n[[upstreams]]\ntype='plain'\naddress='127.0.0.1:{publisher_port}'\n[[discovery]]\ndomain='example.com'\nkey='{}'", key.trim()
+        "listeners=[{{type='dns', address='0.0.0.0:{port}'}}]\n[[upstreams]]\ntype='plain'\naddress='127.0.0.1:{publisher_port}'\n[[discovery]]\ndomain='example.com'\nkey='{}'", key.trim()
     )).unwrap();
     let generated = timeout(
         DEADLINE,
@@ -181,7 +181,7 @@ async fn partial_bind_failure_releases_udp_and_does_not_advertise_startup() {
     let path = directory.path().join("tendns.toml");
     std::fs::write(
         &path,
-        format!("listen=['0.0.0.0:{port}']\n[[upstreams]]\ntype='plain'\naddress='192.0.2.1:53'"),
+        format!("listeners=[{{type='dns', address='0.0.0.0:{port}'}}]\n[[upstreams]]\ntype='plain'\naddress='192.0.2.1:53'"),
     )
     .unwrap();
     let result = timeout(

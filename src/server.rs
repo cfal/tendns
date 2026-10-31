@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Duration};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use hickory_proto::op::{Header, HeaderCounts, Message, ResponseCode};
 use hickory_server::{
@@ -11,18 +11,22 @@ use hickory_server::{
 };
 use tokio::{
     net::{TcpListener, UdpSocket},
-    sync::Semaphore,
+    sync::{Semaphore, watch},
+    task::JoinSet,
 };
 
 use crate::{
-    config::Config,
+    config::{Config, Listener},
     resolver::{Resolver, local_response, validate_request},
     upstream::Forwarder,
 };
 
+mod doh;
+
+#[derive(Clone)]
 pub struct Handler {
     resolver: Arc<Resolver>,
-    permits: Semaphore,
+    permits: Arc<Semaphore>,
     timeout: Duration,
 }
 
@@ -30,7 +34,7 @@ impl Handler {
     pub fn new(resolver: Arc<Resolver>, max_inflight: usize, timeout: Duration) -> Self {
         Self {
             resolver,
-            permits: Semaphore::new(max_inflight),
+            permits: Arc::new(Semaphore::new(max_inflight)),
             timeout,
         }
     }
@@ -102,37 +106,81 @@ pub async fn serve(config: Config) -> Result<()> {
     let config = Arc::new(config);
     let upstream = Arc::new(Forwarder::new(&config.upstreams, config.upstream_timeout)?);
     let resolver = Arc::new(Resolver::new(config.clone(), upstream));
-    let mut server = Server::new(Handler::new(
-        resolver,
-        config.max_inflight,
-        config.request_timeout,
-    ));
+    let handler = Handler::new(resolver, config.max_inflight, config.request_timeout);
+    let mut server = Server::new(handler.clone());
     // Bind everything before starting listeners, so a partial startup is not advertised.
     let mut sockets = Vec::new();
-    for address in &config.listen {
-        let udp = UdpSocket::bind(address)
-            .await
-            .with_context(|| format!("cannot bind UDP listener {address}"))?;
-        let tcp = TcpListener::bind(address)
-            .await
-            .with_context(|| format!("cannot bind TCP listener {address}"))?;
-        sockets.push((udp, tcp));
+    let mut http = Vec::new();
+    for listener in &config.listeners {
+        if let Listener::Dns { address } = listener {
+            let udp = UdpSocket::bind(address)
+                .await
+                .with_context(|| format!("cannot bind UDP listener {address}"))?;
+            let tcp = TcpListener::bind(address)
+                .await
+                .with_context(|| format!("cannot bind TCP listener {address}"))?;
+            sockets.push((udp, tcp));
+        } else {
+            let bound = doh::BoundListener::bind(listener)
+                .await
+                .with_context(|| format!("cannot start DoH listener {}", listener.address()))?;
+            http.push((listener, bound));
+        }
     }
+    let has_dns = !sockets.is_empty();
     for (udp, tcp) in sockets {
         server.register_socket(udp);
         server.register_listener(tcp, Duration::from_secs(30), 32);
     }
-    for address in &config.listen {
-        eprintln!("listening on {address} (UDP/TCP)");
+    let (shutdown, receiver) = watch::channel(false);
+    let mut http_tasks = JoinSet::new();
+    for (listener, bound) in http {
+        let address = listener.address();
+        let protocol = if matches!(listener, Listener::Https { .. }) {
+            "HTTPS"
+        } else {
+            "HTTP"
+        };
+        if bound.unauthenticated() {
+            eprintln!(
+                "warning: {protocol} listener {address} has no auth tokens; authentication is disabled"
+            );
+        }
+        http_tasks.spawn(bound.run(
+            handler.clone(),
+            config.max_inflight,
+            config.request_timeout,
+            receiver.clone(),
+        ));
+        eprintln!("listening on {address} ({protocol}, /dns-query)");
     }
-    tokio::select! {
-        result = server.block_until_done() => result.context("DNS server stopped"),
-        result = shutdown_signal() => {
-            result?;
-            tokio::time::timeout(Duration::from_secs(5), server.shutdown_gracefully()).await.context("DNS shutdown timed out")??;
-            Ok(())
+    for listener in &config.listeners {
+        if let Listener::Dns { address } = listener {
+            eprintln!("listening on {address} (UDP/TCP)");
         }
     }
+    let result = tokio::select! {
+        result = server.block_until_done(), if has_dns => result.context("DNS server stopped"),
+        result = http_tasks.join_next(), if !http_tasks.is_empty() => {
+            match result.expect("HTTP tasks exist") {
+                Ok(Err(error)) => Err(error),
+                Err(error) => Err(error.into()),
+                Ok(Ok(())) => Err(anyhow!("DoH listener stopped unexpectedly")),
+            }
+        }
+        result = shutdown_signal() => result,
+    };
+    let _ = shutdown.send(true);
+    let stopped = tokio::time::timeout(Duration::from_secs(5), async {
+        server.shutdown_gracefully().await?;
+        while let Some(result) = http_tasks.join_next().await {
+            result??;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await
+    .context("DNS shutdown timed out")?;
+    result.and(stopped)
 }
 
 async fn shutdown_signal() -> Result<()> {

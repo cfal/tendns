@@ -1,21 +1,21 @@
 use std::{
     fs,
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
 use anyhow::{Context, Result, ensure};
 use hickory_proto::rr::Name;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use url::Url;
 use zeroize::Zeroizing;
 
 use crate::{names::canonical_name, protocol::Secret};
 
 pub struct Config {
-    pub listen: Vec<SocketAddr>,
+    pub listeners: Vec<Listener>,
     pub upstreams: Vec<Upstream>,
     pub discovery: Vec<Discovery>,
     pub hex_zones: Vec<Name>,
@@ -25,6 +25,47 @@ pub struct Config {
     pub request_timeout: Duration,
     pub cache_capacity: usize,
     pub max_inflight: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, tag = "type", rename_all = "lowercase")]
+pub enum Listener {
+    Dns {
+        address: SocketAddr,
+    },
+    Http {
+        address: SocketAddr,
+        #[serde(default, deserialize_with = "secret_tokens")]
+        auth_tokens: Vec<Zeroizing<String>>,
+        auth_token_file: Option<PathBuf>,
+    },
+    Https {
+        address: SocketAddr,
+        cert: PathBuf,
+        key: PathBuf,
+        #[serde(default, deserialize_with = "secret_tokens")]
+        auth_tokens: Vec<Zeroizing<String>>,
+        auth_token_file: Option<PathBuf>,
+    },
+}
+
+impl Listener {
+    pub fn address(&self) -> SocketAddr {
+        match self {
+            Self::Dns { address } | Self::Http { address, .. } | Self::Https { address, .. } => {
+                *address
+            }
+        }
+    }
+}
+
+fn secret_tokens<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<Zeroizing<String>>, D::Error> {
+    Ok(Vec::<String>::deserialize(deserializer)?
+        .into_iter()
+        .map(Zeroizing::new)
+        .collect())
 }
 
 #[derive(Clone)]
@@ -42,8 +83,8 @@ pub enum Upstream {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    #[serde(default = "default_listen")]
-    listen: Vec<SocketAddr>,
+    #[serde(default = "default_listeners")]
+    listeners: Vec<Listener>,
     #[serde(default)]
     upstreams: Vec<RawUpstream>,
     #[serde(default)]
@@ -78,8 +119,10 @@ struct RawDiscovery {
     key: String,
 }
 
-fn default_listen() -> Vec<SocketAddr> {
-    vec!["0.0.0.0:5300".parse().expect("literal address")]
+fn default_listeners() -> Vec<Listener> {
+    vec![Listener::Dns {
+        address: "0.0.0.0:5300".parse().expect("literal address"),
+    }]
 }
 fn default_ttl() -> u32 {
     60
@@ -104,7 +147,30 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             Zeroizing::new(fs::read_to_string(path).context("cannot read configuration file")?);
-        Self::parse(&text)
+        let mut config = Self::parse(&text)?;
+        let directory = path.parent().unwrap_or_else(|| Path::new("."));
+        for listener in &mut config.listeners {
+            let auth_token_file = match listener {
+                Listener::Https {
+                    cert,
+                    key,
+                    auth_token_file,
+                    ..
+                } => {
+                    *cert = directory.join(&*cert);
+                    *key = directory.join(&*key);
+                    auth_token_file
+                }
+                Listener::Http {
+                    auth_token_file, ..
+                } => auth_token_file,
+                Listener::Dns { .. } => continue,
+            };
+            if let Some(path) = auth_token_file {
+                *path = directory.join(&*path);
+            }
+        }
+        Ok(config)
     }
 
     pub fn parse(text: &str) -> Result<Self> {
@@ -112,11 +178,40 @@ impl Config {
         let raw: RawConfig = toml::from_str(text).map_err(|_| {
             anyhow::anyhow!("invalid TOML configuration; check field names and types")
         })?;
-        ensure!(!raw.listen.is_empty(), "configure at least one listener");
+        let listeners: Vec<_> = raw.listeners.iter().map(Listener::address).collect();
+        ensure!(!listeners.is_empty(), "configure at least one listener");
         ensure!(
-            raw.listen.iter().all(|addr| addr.port() != 0),
+            listeners.iter().all(|addr| addr.port() != 0),
             "listener port must be nonzero"
         );
+        for (i, address) in listeners.iter().enumerate() {
+            ensure!(
+                !listeners[..i].contains(address),
+                "duplicate listener address"
+            );
+        }
+        for listener in &raw.listeners {
+            if let Listener::Https { cert, key, .. } = listener {
+                ensure!(
+                    !cert.as_os_str().is_empty() && !key.as_os_str().is_empty(),
+                    "HTTPS listeners require certificate and key paths"
+                );
+            }
+            if let Listener::Http {
+                auth_token_file, ..
+            }
+            | Listener::Https {
+                auth_token_file, ..
+            } = listener
+            {
+                ensure!(
+                    auth_token_file
+                        .as_ref()
+                        .is_none_or(|path| !path.as_os_str().is_empty()),
+                    "auth_token_file must be a nonempty path"
+                );
+            }
+        }
         ensure!(raw.ttl > 0, "ttl must be positive");
         ensure!(
             raw.cache_capacity > 0 && raw.cache_capacity <= 65_536,
@@ -166,8 +261,10 @@ impl Config {
                         "upstream requires a concrete address and port"
                     );
                     ensure!(
-                        !raw.listen
+                        !raw.listeners
                             .iter()
+                            .filter(|listener| matches!(listener, Listener::Dns { .. }))
+                            .map(Listener::address)
                             .any(|listen| listen.port() == address.port()
                                 && (listen.ip() == address.ip()
                                     || (listen.ip().is_unspecified()
@@ -195,7 +292,7 @@ impl Config {
             });
         }
         Ok(Self {
-            listen: raw.listen,
+            listeners: raw.listeners,
             upstreams,
             discovery,
             hex_zones,
@@ -224,6 +321,72 @@ fn duration(value: &str, name: &str) -> Result<Duration> {
 mod tests {
     use super::*;
     const KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+
+    #[test]
+    fn listener_config_is_typed_and_resolves_paths_relative_to_toml() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+            [[listeners]]
+            type = "http"
+            address = "0.0.0.0:8053"
+            auth_tokens = ["inline-secret"]
+            [[listeners]]
+            type = "https"
+            address = "0.0.0.0:8443"
+            cert = "server.crt"
+            key = "server.key"
+            auth_token_file = "tokens.txt"
+        "#,
+        )
+        .unwrap();
+        let config = Config::load(&path).unwrap();
+        assert_eq!(config.listeners.len(), 2);
+        let Listener::Http {
+            auth_tokens,
+            auth_token_file,
+            ..
+        } = &config.listeners[0]
+        else {
+            panic!()
+        };
+        assert_eq!(auth_tokens[0].as_str(), "inline-secret");
+        assert!(auth_token_file.is_none());
+        let Listener::Https {
+            cert,
+            key,
+            auth_token_file,
+            ..
+        } = &config.listeners[1]
+        else {
+            panic!()
+        };
+        assert_eq!(cert, &directory.path().join("server.crt"));
+        assert_eq!(key, &directory.path().join("server.key"));
+        assert_eq!(
+            auth_token_file.as_ref().unwrap(),
+            &directory.path().join("tokens.txt")
+        );
+        // Config loading must not open startup-only credential files, including for the offline CLI.
+        for invalid in [
+            "listen=['0.0.0.0:5300']",
+            "listeners=[]",
+            "listeners=[{type='dns', address='0.0.0.0:53', auth_tokens=['secret']}]",
+            "listeners=[{type='dns', address='0.0.0.0:53', auth_token_file='tokens'}]",
+            "listeners=[{type='http', address='0.0.0.0:80', cert='cert'}]",
+            "listeners=[{type='https', address='0.0.0.0:443', cert='cert'}]",
+            "listeners=[{type='http', address='0.0.0.0:0'}]",
+            "listeners=[{type='http', address='0.0.0.0:80', auth_token_file=''}]",
+            "listeners=[{type='http', address='0.0.0.0:80'}, {type='dns', address='0.0.0.0:80'}]",
+        ] {
+            let error = Config::parse(invalid)
+                .err()
+                .expect("invalid listener config");
+            assert!(!format!("{error:#}").contains("secret"));
+        }
+    }
 
     #[test]
     fn parses_config_and_selects_longest_domain() {
@@ -266,7 +429,7 @@ mod tests {
     fn rejects_bad_configs_without_printing_secrets() {
         for text in [
             "ttl = 0".to_owned(),
-            "listen = []".to_owned(),
+            "listeners = []".to_owned(),
             "unknown = 1".to_owned(),
             "hex_zones = ['x.com', 'a.x.com']".to_owned(),
             format!(
@@ -292,7 +455,7 @@ mod tests {
     fn rejects_ambiguous_zones_invalid_limits_and_unsupported_upstreams() {
         let discovery = format!("[[discovery]]\ndomain='example.com'\nkey='{KEY}'\n");
         for text in [
-            "listen=['0.0.0.0:0']".to_owned(),
+            "listeners=[{type='dns', address='0.0.0.0:0'}]".to_owned(),
             "cache_capacity=0".to_owned(), "cache_capacity=65537".to_owned(),
             "max_inflight=0".to_owned(), "max_inflight=65537".to_owned(),
             "valid_for='0s'".to_owned(), "upstream_timeout='500ms'".to_owned(),
@@ -316,7 +479,11 @@ mod tests {
             defaults.upstreams.is_empty(),
             "offline key/TXT generation needs no upstream"
         );
-        assert_eq!(defaults.listen, vec!["0.0.0.0:5300".parse().unwrap()]);
+        assert_eq!(defaults.listeners.len(), 1);
+        assert_eq!(
+            defaults.listeners[0].address(),
+            "0.0.0.0:5300".parse().unwrap()
+        );
         assert!(Config::parse("cache_capacity=65536\nmax_inflight=65536").is_ok());
     }
 }

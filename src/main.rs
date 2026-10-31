@@ -26,7 +26,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve ordinary DNS over UDP and TCP.
+    /// Serve DNS over UDP/TCP and configured HTTP/HTTPS listeners.
     Serve,
     /// Generate an encrypted TXT value without making network requests.
     Txt(TxtArgs),

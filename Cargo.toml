@@ -12,15 +12,22 @@ anyhow = "*"
 async-trait = "*"
 aws-lc-rs = "*"
 base64 = "*"
+bytes = "*"
 clap = { version = "*", features = ["derive"] }
 hickory-proto = "*"
 hickory-resolver = { version = "*", default-features = false, features = ["tokio", "https-aws-lc-rs", "webpki-roots"] }
 hickory-server = { version = "*", default-features = false }
 humantime = "*"
+http = "*"
+http-body-util = "*"
+hyper = { version = "*", features = ["server", "http1", "http2"] }
+hyper-util = { version = "*", features = ["server-auto", "tokio"] }
 reqwest = { version = "*", default-features = false, features = ["rustls", "http2", "json", "query"] }
+rustls = { version = "*", default-features = false, features = ["std", "aws_lc_rs"] }
 serde = { version = "*", features = ["derive"] }
 serde_json = "*"
 tokio = { version = "*", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-util"] }
+tokio-rustls = { version = "*", default-features = false, features = ["aws_lc_rs"] }
 toml = "*"
 url = "*"
 zeroize = "*"
@@ -28,12 +35,8 @@ zeroize = "*"
 [dev-dependencies]
 tokio = { version = "*", features = ["test-util", "process"] }
 h2 = "*"
-http = "*"
-bytes = "*"
 rcgen = { version = "*", default-features = false, features = ["crypto", "aws_lc_rs"] }
-rustls = { version = "*", default-features = false, features = ["std", "aws_lc_rs"] }
 tempfile = "*"
-tokio-rustls = { version = "*", default-features = false, features = ["aws_lc_rs"] }
 
 [profile.dev]
 debug = 0
