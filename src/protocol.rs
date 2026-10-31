@@ -79,17 +79,17 @@ impl Publication {
                 );
             }
             entry_name(owner, &entry.subdomain)?;
-            let (count, alias) = owners.entry(&entry.subdomain).or_default();
-            *count += 1;
+            let (entry_count, has_cname) = owners.entry(&entry.subdomain).or_default();
+            *entry_count += 1;
             if let Value::Cname(target) = &entry.value {
                 ensure!(
                     canonical_name(&target.to_ascii())? == *target && target.is_fqdn(),
                     "CNAME target must be absolute"
                 );
-                *alias = true;
+                *has_cname = true;
             }
             ensure!(
-                !*alias || *count == 1,
+                !*has_cname || *entry_count == 1,
                 "CNAME must be the only entry for its hostname"
             );
         }
@@ -147,16 +147,17 @@ impl Publication {
         while !cursor.0.is_empty() {
             ensure!(entries.len() < MAX_ENTRIES, "too many entries");
             let kind = cursor.array::<1>()?[0];
-            let len = cursor.array::<1>()?[0] as usize;
-            let subdomain = std::str::from_utf8(cursor.take(len)?)
+            let subdomain_len = cursor.array::<1>()?[0] as usize;
+            let subdomain = std::str::from_utf8(cursor.take(subdomain_len)?)
                 .context("invalid subdomain")?
                 .to_owned();
             let value = match kind {
                 0 => Value::A(Ipv4Addr::from(cursor.array::<4>()?)),
                 1 => Value::Aaaa(Ipv6Addr::from(cursor.array::<16>()?)),
                 2 => {
-                    let len = u16::from_be_bytes(cursor.array()?) as usize;
-                    let target = std::str::from_utf8(cursor.take(len)?).context("invalid CNAME")?;
+                    let target_len = u16::from_be_bytes(cursor.array()?) as usize;
+                    let target =
+                        std::str::from_utf8(cursor.take(target_len)?).context("invalid CNAME")?;
                     ensure!(target.ends_with('.'), "CNAME target must be absolute");
                     Value::Cname(canonical_name(target)?)
                 }

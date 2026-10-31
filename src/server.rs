@@ -34,6 +34,19 @@ impl Handler {
             timeout,
         }
     }
+
+    async fn resolve(&self, message: Message) -> Message {
+        if let Some(code) = validate_request(&message) {
+            return local_response(&message, code);
+        }
+        let Ok(_permit) = self.permits.try_acquire() else {
+            return local_response(&message, ResponseCode::ServFail);
+        };
+        match tokio::time::timeout(self.timeout, self.resolver.answer(message.clone())).await {
+            Ok(Ok(response)) => response,
+            _ => local_response(&message, ResponseCode::ServFail),
+        }
+    }
 }
 
 #[async_trait]
@@ -43,22 +56,8 @@ impl RequestHandler for Handler {
         request: &Request,
         mut response_handle: R,
     ) -> ResponseInfo {
-        let parsed = Message::from_vec(request.as_slice());
-        let response = match parsed {
-            Ok(message) => {
-                if let Some(code) = validate_request(&message) {
-                    local_response(&message, code)
-                } else if let Ok(_permit) = self.permits.try_acquire() {
-                    match tokio::time::timeout(self.timeout, self.resolver.answer(message.clone()))
-                        .await
-                    {
-                        Ok(Ok(response)) => response,
-                        _ => local_response(&message, ResponseCode::ServFail),
-                    }
-                } else {
-                    local_response(&message, ResponseCode::ServFail)
-                }
-            }
+        let response = match Message::from_vec(request.as_slice()) {
+            Ok(message) => self.resolve(message).await,
             Err(_) => Message::error_msg(
                 request.metadata.id,
                 request.metadata.op_code,

@@ -136,20 +136,18 @@ impl Resolver {
                     for entry in entries {
                         let data = match entry.value {
                             Value::A(ip) if matches!(kind, RecordType::A | RecordType::ANY) => {
-                                Some(RData::A(A(ip)))
+                                RData::A(A(ip))
                             }
                             Value::Aaaa(ip)
                                 if matches!(kind, RecordType::AAAA | RecordType::ANY) =>
                             {
-                                Some(RData::AAAA(AAAA(ip)))
+                                RData::AAAA(AAAA(ip))
                             }
-                            _ => None,
+                            _ => continue,
                         };
-                        if let Some(data) = data {
-                            let record = Record::from_rdata(name.clone(), ttl, data);
-                            if !response.answers.contains(&record) {
-                                response.answers.push(record);
-                            }
+                        let record = Record::from_rdata(name.clone(), ttl, data);
+                        if !response.answers.contains(&record) {
+                            response.answers.push(record);
                         }
                     }
                     return self.finish_local(response, synthesized_at, expires_at);
@@ -253,12 +251,14 @@ impl Resolver {
         if entries.is_empty() && !subdomain.is_empty() {
             return Ok(None);
         }
-        let ttl = (cached
+        let cache_ttl = cached
             .until
             .saturating_duration_since(Instant::now())
-            .as_secs()
+            .as_secs();
+        let remaining_validity = publication.expires_at - now;
+        let ttl = cache_ttl
             .min(u64::from(self.config.ttl))
-            .min(publication.expires_at - now)) as u32;
+            .min(remaining_validity) as u32;
         Ok(Some(Local::Found {
             entries,
             ttl,
@@ -301,8 +301,9 @@ impl Resolver {
         query
             .queries
             .push(Query::query(owner.clone(), RecordType::TXT));
-        query.edns = Some(Edns::new());
-        query.edns.as_mut().expect("set EDNS").set_max_payload(1232);
+        let mut edns = Edns::new();
+        edns.set_max_payload(1232);
+        query.edns = Some(edns);
         let answer = self.upstream.exchange(query).await?;
         let now = self.clock.now()?;
         let (publication, ttl) =
@@ -354,8 +355,8 @@ fn collect_publications(
             .any(|r| r.name == *owner && matches!(r.data, RData::CNAME(_))),
         "TXT CNAME indirection is not supported"
     );
-    let mut candidates = 0;
-    let mut total = 0;
+    let mut txt_count = 0;
+    let mut total_bytes = 0;
     let mut combined: Option<Publication> = None;
     let mut ttl = ttl_cap;
     for record in &response.answers {
@@ -365,17 +366,13 @@ fn collect_publications(
         let RData::TXT(txt) = &record.data else {
             continue;
         };
-        candidates += 1;
-        total += txt.txt_data.iter().map(|chunk| chunk.len()).sum::<usize>();
+        txt_count += 1;
+        total_bytes += txt.txt_data.iter().map(|chunk| chunk.len()).sum::<usize>();
         ensure!(
-            candidates <= 16 && total <= protocol::MAX_ENCODED * 16,
+            txt_count <= 16 && total_bytes <= protocol::MAX_ENCODED * 16,
             "TXT response exceeds limits"
         );
-        let value: Vec<u8> = txt
-            .txt_data
-            .iter()
-            .flat_map(|s| s.iter().copied())
-            .collect();
+        let value = txt.txt_data.concat();
         let prefix = value.split(|byte| *byte == b'.').next().unwrap_or_default();
         let is_encrypted = prefix
             .strip_prefix(b"td")

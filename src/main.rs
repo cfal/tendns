@@ -62,71 +62,69 @@ async fn main() {
 }
 
 async fn run(cli: Cli) -> Result<()> {
-    if matches!(cli.command, Command::Keygen) {
-        println!("{}", Secret::generate()?);
-        return Ok(());
-    }
-    let config = Config::load(&cli.config)?;
     match cli.command {
-        Command::Serve => tendns::server::serve(config).await,
-        Command::Txt(args) => {
-            let owner = canonical_name(&args.name)?;
-            let discovery = config
-                .discovery_for(&owner)
-                .context("TXT owner is not within a configured discovery domain")?;
-            let subdomain = args.subdomain.to_ascii_lowercase();
-            if !subdomain.is_empty() {
-                validate_label(&subdomain)?;
-            }
-            let mut entries = Vec::new();
-            for ip in args.a {
-                entries.push(Entry {
-                    subdomain: subdomain.clone(),
-                    value: Value::A(ip),
-                });
-            }
-            for ip in args.aaaa {
-                entries.push(Entry {
-                    subdomain: subdomain.clone(),
-                    value: Value::Aaaa(ip),
-                });
-            }
-            if let Some(target) = args.cname {
-                entries.push(Entry {
-                    subdomain,
-                    value: Value::Cname(canonical_name(&target)?),
-                });
-            }
-            for entry in args.entries {
-                entries.push(parse_entry(&entry)?);
-            }
-            let validity = match args.valid_for {
-                Some(value) => {
-                    humantime::parse_duration(&value).context("invalid --valid-for duration")?
-                }
-                None => config.valid_for,
-            };
-            ensure!(
-                validity.as_secs() > 0,
-                "validity must be at least one second"
-            );
-            let issued_at = SystemClock.now()?;
-            let expires_at = issued_at
-                .checked_add(validity.as_secs())
-                .context("expiry overflows timestamp")?;
-            let publication = Publication {
-                issued_at,
-                expires_at,
-                entries,
-            };
-            println!(
-                "{}",
-                protocol::encrypt(&publication, &discovery.key, &owner)?
-            );
-            Ok(())
+        Command::Serve => {
+            let config = Config::load(&cli.config)?;
+            tendns::server::serve(config).await?;
         }
-        Command::Keygen => unreachable!(),
+        Command::Txt(args) => {
+            let config = Config::load(&cli.config)?;
+            println!("{}", generate_txt(&config, args)?);
+        }
+        Command::Keygen => println!("{}", Secret::generate()?),
     }
+    Ok(())
+}
+
+fn generate_txt(config: &Config, args: TxtArgs) -> Result<String> {
+    let owner = canonical_name(&args.name)?;
+    let discovery = config
+        .discovery_for(&owner)
+        .context("TXT owner is not within a configured discovery domain")?;
+    let subdomain = args.subdomain.to_ascii_lowercase();
+    if !subdomain.is_empty() {
+        validate_label(&subdomain)?;
+    }
+    let mut entries = Vec::new();
+    for ip in args.a {
+        entries.push(Entry {
+            subdomain: subdomain.clone(),
+            value: Value::A(ip),
+        });
+    }
+    for ip in args.aaaa {
+        entries.push(Entry {
+            subdomain: subdomain.clone(),
+            value: Value::Aaaa(ip),
+        });
+    }
+    if let Some(target) = args.cname {
+        entries.push(Entry {
+            subdomain,
+            value: Value::Cname(canonical_name(&target)?),
+        });
+    }
+    for entry in args.entries {
+        entries.push(parse_entry(&entry)?);
+    }
+    let validity = match args.valid_for {
+        Some(value) => humantime::parse_duration(&value).context("invalid --valid-for duration")?,
+        None => config.valid_for,
+    };
+    ensure!(
+        validity.as_secs() > 0,
+        "validity must be at least one second"
+    );
+    let issued_at = SystemClock.now()?;
+    let expires_at = issued_at
+        .checked_add(validity.as_secs())
+        .context("expiry overflows timestamp")?;
+    let publication = Publication {
+        issued_at,
+        expires_at,
+        entries,
+    };
+    protocol::encrypt(&publication, &discovery.key, &owner)
 }
 
 fn parse_entry(text: &str) -> Result<Entry> {
