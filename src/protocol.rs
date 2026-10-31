@@ -234,6 +234,17 @@ fn encrypt_with_nonce(
 }
 
 pub fn decrypt(value: &[u8], secret: &Secret, owner: &Name, now: u64) -> Result<Publication> {
+    let publication = decrypt_for_update(value, secret, owner)?;
+    publication.validate_time(now)?;
+    Ok(publication)
+}
+
+// Administrative updates must authenticate expired publications without renewing them implicitly.
+pub(crate) fn decrypt_for_update(
+    value: &[u8],
+    secret: &Secret,
+    owner: &Name,
+) -> Result<Publication> {
     ensure!(value.len() <= MAX_ENCODED, "TXT value too large");
     let encoded = value
         .strip_prefix(PREFIX.as_bytes())
@@ -251,9 +262,14 @@ pub fn decrypt(value: &[u8], secret: &Secret, owner: &Name, now: u64) -> Result<
             &mut encrypted,
         )
         .map_err(|_| anyhow::anyhow!("TXT authentication failed"))?;
-    let publication = Publication::decode(plaintext, owner)?;
-    publication.validate_time(now)?;
-    Ok(publication)
+    Publication::decode(plaintext, owner)
+}
+
+pub(crate) fn is_encrypted_txt(value: &[u8]) -> bool {
+    let prefix = value.split(|byte| *byte == b'.').next().unwrap_or_default();
+    prefix
+        .strip_prefix(b"td")
+        .is_some_and(|version| !version.is_empty() && version.iter().all(u8::is_ascii_digit))
 }
 
 #[cfg(test)]

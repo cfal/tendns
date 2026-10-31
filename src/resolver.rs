@@ -333,7 +333,7 @@ pub fn local_response(request: &Message, code: ResponseCode) -> Message {
     result
 }
 
-fn collect_publications(
+pub(crate) fn collect_publications(
     response: &Message,
     owner: &Name,
     discovery: &Discovery,
@@ -373,11 +373,7 @@ fn collect_publications(
             "TXT response exceeds limits"
         );
         let value = txt.txt_data.concat();
-        let prefix = value.split(|byte| *byte == b'.').next().unwrap_or_default();
-        let is_encrypted = prefix
-            .strip_prefix(b"td")
-            .is_some_and(|version| !version.is_empty() && version.iter().all(u8::is_ascii_digit));
-        if !is_encrypted {
+        if !protocol::is_encrypted_txt(&value) {
             continue;
         }
         // A bad sibling value may contain the queried hidden label. It is not a miss.
