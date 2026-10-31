@@ -11,27 +11,36 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
 }
 
+fn set_parent_entries(policy: &Policy, mock: &Mock, entries: Vec<Entry>) {
+    let mut parent = reply();
+    parent
+        .answers
+        .push(txt(policy, "example.com", &publication(entries, 100), 60));
+    mock.set("example.com", RecordType::TXT, parent);
+}
+
+fn alias(label: &str, target: &str) -> Entry {
+    Entry {
+        subdomain: label.into(),
+        value: Value::Cname(canonical_name(target).unwrap()),
+    }
+}
+
 #[tokio::test]
 async fn private_addresses_obey_family_selection_without_querying_original_name() {
     let (config, mock, _, resolver) = setup();
-    let mut parent = reply();
-    parent.answers.push(txt(
+    set_parent_entries(
         &config,
-        "example.com",
-        &publication(
-            vec![
-                entry("nas", "192.0.2.1"),
-                entry("nas", "192.0.2.2"),
-                Entry {
-                    subdomain: "nas".into(),
-                    value: Value::Aaaa("2001:db8::1".parse().unwrap()),
-                },
-            ],
-            100,
-        ),
-        60,
-    ));
-    mock.set("example.com", RecordType::TXT, parent);
+        &mock,
+        vec![
+            entry("nas", "192.0.2.1"),
+            entry("nas", "192.0.2.2"),
+            Entry {
+                subdomain: "nas".into(),
+                value: Value::Aaaa("2001:db8::1".parse().unwrap()),
+            },
+        ],
+    );
     for (strategy, expected) in [
         (IpStrategy::Ipv4Only, vec!["192.0.2.1", "192.0.2.2"]),
         (IpStrategy::Ipv6Only, vec!["2001:db8::1"]),
@@ -65,14 +74,7 @@ async fn private_addresses_obey_family_selection_without_querying_original_name(
 #[tokio::test]
 async fn missing_family_is_nodata_and_never_uses_a_shadowed_direct_entry() {
     let (config, mock, _, resolver) = setup();
-    let mut parent = reply();
-    parent.answers.push(txt(
-        &config,
-        "example.com",
-        &publication(vec![entry("nas", "192.0.2.1")], 100),
-        60,
-    ));
-    mock.set("example.com", RecordType::TXT, parent);
+    set_parent_entries(&config, &mock, vec![entry("nas", "192.0.2.1")]);
     let error = resolver
         .lookup_ip(
             canonical_name("nas.example.com").unwrap(),
@@ -102,25 +104,15 @@ async fn missing_family_is_nodata_and_never_uses_a_shadowed_direct_entry() {
 #[tokio::test]
 async fn lookup_follows_local_aliases_and_preserves_public_native_fallback() {
     let (config, mock, _, resolver) = setup();
-    let alias = |label: &str, target: &str| Entry {
-        subdomain: label.into(),
-        value: Value::Cname(canonical_name(target).unwrap()),
-    };
-    let mut parent = reply();
-    parent.answers.push(txt(
+    set_parent_entries(
         &config,
-        "example.com",
-        &publication(
-            vec![
-                alias("www", "next.example.com"),
-                alias("next", "external.test"),
-                alias("hex", "c0000201.hex.test"),
-            ],
-            100,
-        ),
-        60,
-    ));
-    mock.set("example.com", RecordType::TXT, parent);
+        &mock,
+        vec![
+            alias("www", "next.example.com"),
+            alias("next", "external.test"),
+            alias("hex", "c0000201.hex.test"),
+        ],
+    );
     let end = deadline();
     let result = resolver
         .lookup_ip(
@@ -191,20 +183,7 @@ async fn unrelated_names_delegate_without_dns_exchange() {
 #[tokio::test]
 async fn lookup_rechecks_authenticated_expiry_after_public_fallback() {
     let (config, mock, clock, resolver) = setup();
-    let mut parent = reply();
-    parent.answers.push(txt(
-        &config,
-        "example.com",
-        &publication(
-            vec![Entry {
-                subdomain: "www".into(),
-                value: Value::Cname(canonical_name("external.test").unwrap()),
-            }],
-            100,
-        ),
-        60,
-    ));
-    mock.set("example.com", RecordType::TXT, parent);
+    set_parent_entries(&config, &mock, vec![alias("www", "external.test")]);
     let error = resolver
         .lookup_ip(
             canonical_name("www.example.com").unwrap(),
@@ -325,18 +304,14 @@ async fn local_cname_loops_and_depth_limits_are_enforced_for_address_lookups() {
     for count in [1, 17] {
         let (config, mock, _, resolver) = setup();
         let entries = (0..count)
-            .map(|i| Entry {
-                subdomain: format!("n{i}"),
-                value: Value::Cname(
-                    canonical_name(&format!("n{}.example.com", (i + 1) % count)).unwrap(),
-                ),
+            .map(|i| {
+                alias(
+                    &format!("n{i}"),
+                    &format!("n{}.example.com", (i + 1) % count),
+                )
             })
             .collect();
-        let mut parent = reply();
-        parent
-            .answers
-            .push(txt(&config, "example.com", &publication(entries, 100), 60));
-        mock.set("example.com", RecordType::TXT, parent);
+        set_parent_entries(&config, &mock, entries);
         let error = resolver
             .lookup_ip(
                 canonical_name("n0.example.com").unwrap(),
@@ -358,20 +333,10 @@ async fn local_cname_loops_and_depth_limits_are_enforced_for_address_lookups() {
 async fn sixteen_names_can_end_in_an_ipv6_only_public_target() {
     let (config, mock, _, resolver) = setup();
     let mut entries: Vec<_> = (0..14)
-        .map(|i| Entry {
-            subdomain: format!("n{i}"),
-            value: Value::Cname(canonical_name(&format!("n{}.example.com", i + 1)).unwrap()),
-        })
+        .map(|i| alias(&format!("n{i}"), &format!("n{}.example.com", i + 1)))
         .collect();
-    entries.push(Entry {
-        subdomain: "n14".into(),
-        value: Value::Cname(canonical_name("external.test").unwrap()),
-    });
-    let mut parent = reply();
-    parent
-        .answers
-        .push(txt(&config, "example.com", &publication(entries, 100), 60));
-    mock.set("example.com", RecordType::TXT, parent);
+    entries.push(alias("n14", "external.test"));
+    set_parent_entries(&config, &mock, entries);
     let addresses = resolver
         .lookup_ip(
             canonical_name("n0.example.com").unwrap(),
@@ -455,14 +420,7 @@ async fn deadline_covers_native_fallback_and_already_expired_requests_do_no_work
 #[tokio::test(start_paused = true)]
 async fn a_cache_waiter_times_out_without_canceling_the_fetch_owner() {
     let (config, mock, _, resolver) = setup();
-    let mut parent = reply();
-    parent.answers.push(txt(
-        &config,
-        "example.com",
-        &publication(vec![entry("nas", "192.0.2.1")], 100),
-        60,
-    ));
-    mock.set("example.com", RecordType::TXT, parent);
+    set_parent_entries(&config, &mock, vec![entry("nas", "192.0.2.1")]);
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     *mock.gate.lock().unwrap() = Some(gate.clone());
     let owner = resolver.answer_with_deadline(query("nas.example.com", RecordType::A), deadline());
