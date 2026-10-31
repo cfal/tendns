@@ -1,3 +1,6 @@
+#[path = "resolution/cache.rs"]
+mod cache;
+
 use std::{
     collections::HashMap,
     sync::{
@@ -29,6 +32,7 @@ const KEY: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
 struct Mock {
     replies: Mutex<HashMap<(Name, RecordType), Message>>,
     calls: Mutex<Vec<(Name, RecordType)>>,
+    gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
 }
 
 impl Mock {
@@ -57,6 +61,10 @@ impl Exchange for Mock {
             query.queries[0].query_type(),
         );
         self.calls.lock().unwrap().push(key.clone());
+        let gate = self.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.acquire_owned().await?.forget();
+        }
         self.replies
             .lock()
             .unwrap()
@@ -133,6 +141,14 @@ fn setup() -> (Arc<Config>, Arc<Mock>, Arc<FakeClock>, Resolver) {
     let clock = Arc::new(FakeClock(AtomicU64::new(100)));
     let resolver = Resolver::with_clock(config.clone(), mock.clone(), clock.clone());
     (config, mock, clock, resolver)
+}
+
+async fn assert_pending<F: std::future::Future>(mut future: std::pin::Pin<&mut F>) {
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
 }
 
 #[tokio::test]
@@ -352,29 +368,6 @@ async fn invalid_sibling_value_is_not_a_confirmed_hidden_name_miss() {
 }
 
 #[tokio::test]
-async fn expiry_bounds_ttl_and_invalidates_cached_payload() {
-    let (config, mock, clock, resolver) = setup();
-    let mut answer = reply();
-    let mut p = publication(vec![entry("", "192.0.2.1")], 100);
-    p.expires_at = 105;
-    answer.answers.push(txt(&config, "example.com", &p, 600));
-    mock.set("example.com", RecordType::TXT, answer);
-    let result = resolver
-        .answer(query("example.com", RecordType::A))
-        .await
-        .unwrap();
-    assert!(result.answers[0].ttl <= 5);
-    clock.0.store(105, Ordering::SeqCst);
-    assert!(
-        resolver
-            .answer(query("example.com", RecordType::A))
-            .await
-            .is_err()
-    );
-    assert_eq!(mock.calls().len(), 2);
-}
-
-#[tokio::test]
 async fn cname_chain_loop_and_txt_indirection() {
     let (config, mock, _, resolver) = setup();
     let mut answer = reply();
@@ -525,25 +518,6 @@ async fn forwarding_preserves_sections_and_flags() {
 }
 
 #[tokio::test]
-async fn concurrent_parent_queries_share_one_fetch() {
-    let (config, mock, _, resolver) = setup();
-    let mut answer = reply();
-    answer.answers.push(txt(
-        &config,
-        "example.com",
-        &publication(vec![entry("a", "192.0.2.1"), entry("b", "192.0.2.2")], 100),
-        60,
-    ));
-    mock.set("example.com", RecordType::TXT, answer);
-    let (a, b) = tokio::join!(
-        resolver.answer(query("a.example.com", RecordType::A)),
-        resolver.answer(query("b.example.com", RecordType::A))
-    );
-    assert!(a.is_ok() && b.is_ok());
-    assert_eq!(mock.calls().len(), 1);
-}
-
-#[tokio::test]
 async fn hidden_children_do_not_make_their_parent_nxdomain() {
     let (config, mock, _, resolver) = setup();
     let mut answer = reply();
@@ -603,64 +577,6 @@ async fn parent_search_stops_at_the_most_specific_configured_domain() {
         mock.calls(),
         vec![("inner.example.com.".into(), RecordType::TXT)]
     );
-}
-
-#[tokio::test]
-async fn dns_ttl_refreshes_positive_and_negative_cache_entries() {
-    for positive in [false, true] {
-        let (config, mock, _, resolver) = setup();
-        let mut answer = reply();
-        if positive {
-            answer.answers.push(txt(
-                &config,
-                "example.com",
-                &publication(vec![entry("", "192.0.2.1")], 100),
-                1,
-            ));
-        } else {
-            answer.metadata.response_code = ResponseCode::NXDomain;
-            answer.authorities.push(Record::from_rdata(
-                canonical_name("example.com").unwrap(),
-                30,
-                RData::SOA(SOA::new(
-                    canonical_name("ns.example.com").unwrap(),
-                    canonical_name("admin.example.com").unwrap(),
-                    1,
-                    30,
-                    30,
-                    30,
-                    1,
-                )),
-            ));
-        }
-        mock.set("example.com", RecordType::TXT, answer);
-        for _ in 0..2 {
-            let result = resolver
-                .answer(query("example.com", RecordType::A))
-                .await
-                .unwrap();
-            assert_eq!(result.answers.len(), usize::from(positive));
-        }
-        assert_eq!(mock.calls().len(), 1);
-        let mut answer = reply();
-        answer.answers.push(txt(
-            &config,
-            "example.com",
-            &publication(vec![entry("", "192.0.2.2")], 100),
-            60,
-        ));
-        mock.set("example.com", RecordType::TXT, answer);
-        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-        let result = resolver
-            .answer(query("example.com", RecordType::A))
-            .await
-            .unwrap();
-        assert_eq!(
-            result.answers[0].data,
-            RData::A(A("192.0.2.2".parse().unwrap()))
-        );
-        assert_eq!(mock.calls().len(), 2);
-    }
 }
 
 #[tokio::test]
@@ -724,4 +640,169 @@ async fn cname_into_forwarded_dns_preserves_chain_without_claiming_validation() 
             ("external.net.".into(), RecordType::A)
         ]
     );
+}
+
+#[tokio::test]
+async fn cname_depth_limit_accepts_sixteen_names_but_not_seventeen() {
+    for count in [16, 17] {
+        let (config, mock, _, resolver) = setup();
+        let mut entries: Vec<_> = (0..count - 1)
+            .map(|i| Entry {
+                subdomain: format!("n{i}"),
+                value: Value::Cname(canonical_name(&format!("n{}.example.com", i + 1)).unwrap()),
+            })
+            .collect();
+        entries.push(entry(&format!("n{}", count - 1), "192.0.2.1"));
+        let mut answer = reply();
+        answer
+            .answers
+            .push(txt(&config, "example.com", &publication(entries, 100), 60));
+        mock.set("example.com", RecordType::TXT, answer);
+        let answer = resolver
+            .answer(query("n0.example.com", RecordType::A))
+            .await;
+        if count == 16 {
+            assert_eq!(answer.unwrap().answers.len(), 16);
+        } else {
+            assert!(answer.unwrap_err().to_string().contains("CNAME chain"));
+        }
+        assert_eq!(mock.calls().len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn direct_owner_does_not_use_its_hidden_child_as_its_own_address() {
+    let (config, mock, _, resolver) = setup();
+    mock.set("example.com", RecordType::TXT, reply());
+    let mut answer = reply();
+    answer.answers.push(txt(
+        &config,
+        "nas.example.com",
+        &publication(vec![entry("hidden", "192.0.2.1")], 100),
+        60,
+    ));
+    mock.set("nas.example.com", RecordType::TXT, answer);
+    let own = resolver
+        .answer(query("nas.example.com", RecordType::A))
+        .await
+        .unwrap();
+    assert!(own.answers.is_empty());
+    assert_eq!(own.metadata.response_code, ResponseCode::NoError);
+    let child = resolver
+        .answer(query("hidden.nas.example.com", RecordType::A))
+        .await
+        .unwrap();
+    assert_eq!(
+        child.answers[0].data,
+        RData::A(A("192.0.2.1".parse().unwrap()))
+    );
+    assert_eq!(mock.calls().len(), 2);
+}
+
+#[tokio::test]
+async fn txt_fragments_from_separate_records_are_never_concatenated() {
+    let (config, mock, _, resolver) = setup();
+    let owner = canonical_name("example.com").unwrap();
+    let value = encrypt(
+        &publication(vec![entry("nas", "192.0.2.1")], 100),
+        &config.discovery[0].key,
+        &owner,
+    )
+    .unwrap();
+    let mut answer = reply();
+    for part in value.as_bytes().chunks(value.len() / 2) {
+        answer.answers.push(Record::from_rdata(
+            owner.clone(),
+            60,
+            RData::TXT(TXT::from_bytes(vec![part])),
+        ));
+    }
+    mock.set("example.com", RecordType::TXT, answer);
+    assert!(
+        resolver
+            .answer(query("nas.example.com", RecordType::A))
+            .await
+            .is_err()
+    );
+    assert_eq!(mock.calls(), vec![("example.com.".into(), RecordType::TXT)]);
+}
+
+#[tokio::test]
+async fn only_in_class_txt_answers_at_the_expected_owner_are_used() {
+    let (config, mock, _, resolver) = setup();
+    let mut answer = reply();
+    let bad = Record::from_rdata(
+        canonical_name("example.com").unwrap(),
+        60,
+        RData::TXT(TXT::new(vec!["td1.invalid".into()])),
+    );
+    let mut wrong_owner = bad.clone();
+    wrong_owner.name = canonical_name("other.example.com").unwrap();
+    let mut wrong_class = bad.clone();
+    wrong_class.dns_class = hickory_proto::rr::DNSClass::CH;
+    answer.answers = vec![wrong_owner, wrong_class];
+    answer.additionals.push(bad);
+    answer.answers.push(Record::from_rdata(
+        canonical_name("example.com").unwrap(),
+        60,
+        RData::TXT(TXT::new(vec!["v=spf1 -all".into()])),
+    ));
+    answer.answers.push(txt(
+        &config,
+        "example.com",
+        &publication(vec![entry("nas", "192.0.2.1")], 100),
+        60,
+    ));
+    mock.set("example.com", RecordType::TXT, answer);
+    let answer = resolver
+        .answer(query("nas.example.com", RecordType::A))
+        .await
+        .unwrap();
+    assert_eq!(answer.answers.len(), 1);
+    assert_eq!(
+        answer.answers[0].data,
+        RData::A(A("192.0.2.1".parse().unwrap()))
+    );
+}
+
+#[tokio::test]
+async fn existing_name_returns_only_requested_records_or_nodata() {
+    let (config, mock, _, resolver) = setup();
+    let mut answer = reply();
+    answer.answers.push(txt(
+        &config,
+        "example.com",
+        &publication(
+            vec![
+                entry("nas", "192.0.2.1"),
+                Entry {
+                    subdomain: "nas".into(),
+                    value: Value::Aaaa("2001:db8::1".parse().unwrap()),
+                },
+            ],
+            100,
+        ),
+        60,
+    ));
+    mock.set("example.com", RecordType::TXT, answer);
+    for (kind, count) in [
+        (RecordType::A, 1),
+        (RecordType::AAAA, 1),
+        (RecordType::ANY, 2),
+        (RecordType::CNAME, 0),
+        (RecordType::TXT, 0),
+        (RecordType::HTTPS, 0),
+    ] {
+        let answer = resolver
+            .answer(query("nas.example.com", kind))
+            .await
+            .unwrap();
+        assert_eq!(
+            answer.metadata.response_code,
+            ResponseCode::NoError,
+            "{kind:?}"
+        );
+        assert_eq!(answer.answers.len(), count, "{kind:?}");
+    }
+    assert_eq!(mock.calls(), vec![("example.com.".into(), RecordType::TXT)]);
 }

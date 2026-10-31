@@ -52,7 +52,11 @@ struct Cached {
 enum Local {
     Forward,
     Missing,
-    Found { entries: Vec<Entry>, ttl: u32 },
+    Found {
+        entries: Vec<Entry>,
+        ttl: u32,
+        expires_at: Option<u64>,
+    },
 }
 
 impl Resolver {
@@ -80,6 +84,8 @@ impl Resolver {
         let kind = question.query_type();
         let mut seen = HashSet::new();
         let mut response = local_response(&request, ResponseCode::NoError);
+        let mut synthesized_at = None;
+        let mut expires_at: Option<u64> = None;
         for _ in 0..16 {
             ensure!(seen.insert(name.clone()), "CNAME loop");
             match self.local(&name).await? {
@@ -90,6 +96,7 @@ impl Resolver {
                     result.metadata.id = request.metadata.id;
                     result.queries = request.queries.clone();
                     if !response.answers.is_empty() {
+                        response = self.finish_local(response, synthesized_at, expires_at)?;
                         response.answers.append(&mut result.answers);
                         result.answers = response.answers;
                         result.metadata.authentic_data = false;
@@ -99,9 +106,18 @@ impl Resolver {
                 }
                 Local::Missing => {
                     response.metadata.response_code = ResponseCode::NXDomain;
-                    return Ok(response);
+                    return self.finish_local(response, synthesized_at, expires_at);
                 }
-                Local::Found { entries, ttl } => {
+                Local::Found {
+                    entries,
+                    ttl,
+                    expires_at: entry_expiry,
+                } => {
+                    synthesized_at.get_or_insert_with(Instant::now);
+                    if let Some(expiry) = entry_expiry {
+                        expires_at =
+                            Some(expires_at.map_or(expiry, |previous| previous.min(expiry)));
+                    }
                     if let Some(target) = entries.iter().find_map(|entry| match &entry.value {
                         Value::Cname(target) => Some(target),
                         _ => None,
@@ -112,7 +128,7 @@ impl Resolver {
                             RData::CNAME(CNAME(target.clone())),
                         ));
                         if matches!(kind, RecordType::CNAME | RecordType::ANY) {
-                            return Ok(response);
+                            return self.finish_local(response, synthesized_at, expires_at);
                         }
                         name = target.clone();
                         continue;
@@ -136,11 +152,34 @@ impl Resolver {
                             }
                         }
                     }
-                    return Ok(response);
+                    return self.finish_local(response, synthesized_at, expires_at);
                 }
             }
         }
         bail!("CNAME chain exceeds 16 names")
+    }
+
+    fn finish_local(
+        &self,
+        mut response: Message,
+        synthesized_at: Option<Instant>,
+        expires_at: Option<u64>,
+    ) -> Result<Message> {
+        let remaining = if let Some(expiry) = expires_at {
+            let now = self.clock.now()?;
+            ensure!(now < expiry, "publication expired during resolution");
+            (expiry - now).min(u64::from(u32::MAX)) as u32
+        } else {
+            u32::MAX
+        };
+        if let Some(started) = synthesized_at {
+            // Conservatively age the local chain; newly received upstream records are untouched.
+            let elapsed = started.elapsed().as_secs().min(u64::from(u32::MAX)) as u32;
+            for record in &mut response.answers {
+                record.ttl = record.ttl.saturating_sub(elapsed).min(remaining);
+            }
+        }
+        Ok(response)
     }
 
     async fn local(&self, name: &Name) -> Result<Local> {
@@ -152,6 +191,7 @@ impl Resolver {
                 return Ok(Local::Found {
                     entries: Vec::new(),
                     ttl: self.config.ttl,
+                    expires_at: None,
                 });
             }
             if name.num_labels() != zone.num_labels() + 1 {
@@ -171,6 +211,7 @@ impl Resolver {
                     value: Value::A(ip),
                 }],
                 ttl: self.config.ttl,
+                expires_at: None,
             });
         }
         let Some(discovery) = self.config.discovery_for(name) else {
@@ -218,7 +259,11 @@ impl Resolver {
             .as_secs()
             .min(u64::from(self.config.ttl))
             .min(publication.expires_at - now)) as u32;
-        Ok(Some(Local::Found { entries, ttl }))
+        Ok(Some(Local::Found {
+            entries,
+            ttl,
+            expires_at: Some(publication.expires_at),
+        }))
     }
 
     async fn publication(&self, owner: &Name, discovery: &Discovery) -> Result<Cached> {
