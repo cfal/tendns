@@ -13,7 +13,11 @@ fn discovery(domain: &str) -> Discovery {
 fn canonical_names_and_most_specific_key_selection() {
     let inner_key = discovery("INNER.example.com");
     let policy = Policy::new(
-        vec![discovery("EXAMPLE.com"), inner_key.clone()],
+        vec![
+            discovery("EXAMPLE.com"),
+            inner_key.clone(),
+            discovery("other.test"),
+        ],
         vec![Name::from_ascii("HEX.TEST").unwrap()],
         60,
         1024,
@@ -35,6 +39,14 @@ fn canonical_names_and_most_specific_key_selection() {
         .unwrap();
     assert!(Arc::ptr_eq(&selected.key, &inner_key.key));
     assert_eq!(selected.domain.to_ascii(), "inner.example.com.");
+    assert_eq!(
+        policy
+            .discovery()
+            .iter()
+            .map(|item| item.domain.to_ascii())
+            .collect::<Vec<_>>(),
+        ["inner.example.com.", "example.com.", "other.test."]
+    );
     assert_eq!(policy.hex_zones()[0].to_ascii(), "hex.test.");
     assert_eq!(policy.ttl(), 60);
     assert_eq!(policy.cache_capacity(), 1024);
@@ -46,6 +58,7 @@ fn invalid_or_ambiguous_namespaces_and_limits_are_rejected() {
         vec!["."],
         vec!["_dns.example"],
         vec!["example.com", "EXAMPLE.com."],
+        vec!["example.com", "other.test", "EXAMPLE.com."],
     ] {
         assert!(
             Policy::new(

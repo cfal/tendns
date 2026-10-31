@@ -1,6 +1,6 @@
 //! Validated resolution policy, independent of configuration file formats.
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use anyhow::{Result, ensure};
 use hickory_proto::rr::Name;
@@ -44,11 +44,9 @@ impl Policy {
             item.domain = canonical_name(&item.domain.to_ascii())?;
         }
         discovery.sort_by_key(|d| std::cmp::Reverse(d.domain.num_labels()));
-        for (index, item) in discovery.iter().enumerate() {
-            ensure!(
-                !discovery[..index].iter().any(|d| d.domain == item.domain),
-                "duplicate discovery domain"
-            );
+        let mut seen = HashSet::new();
+        for item in &discovery {
+            ensure!(seen.insert(&item.domain), "duplicate discovery domain");
         }
         let mut canonical_hex: Vec<Name> = Vec::new();
         for zone in hex_zones {
