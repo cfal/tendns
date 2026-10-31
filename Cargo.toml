@@ -1,0 +1,40 @@
+[package]
+name = "tendns"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "DNS forwarder with encrypted TXT discovery and hexadecimal IPv4 names"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+aws-lc-rs = "1.19"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+hickory-proto = "=0.26.3"
+hickory-resolver = { version = "=0.26.3", default-features = false, features = ["tokio", "https-aws-lc-rs", "webpki-roots"] }
+hickory-server = { version = "=0.26.3", default-features = false }
+humantime = "2"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-util"] }
+toml = "0.9"
+url = "2"
+zeroize = "1"
+
+[dev-dependencies]
+h2 = "0.4"
+http = "1"
+bytes = "1"
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
+tempfile = "3"
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+
+[profile.dev]
+debug = 0
+
+[profile.test]
+debug = 0
+
+[profile.release]
+strip = true
