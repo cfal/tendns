@@ -18,7 +18,7 @@ cli = [
     "dep:humantime", "dep:http", "dep:http-body-util", "dep:hyper",
     "dep:hyper-util", "dep:reqwest", "dep:rustls", "dep:serde",
     "dep:serde_json", "dep:tokio-rustls", "dep:toml", "dep:url",
-    "tokio/rt-multi-thread", "tokio/net", "tokio/signal", "tokio/io-util",
+    "tokio/macros", "tokio/rt-multi-thread", "tokio/net", "tokio/signal", "tokio/io-util",
 ]
 
 [[bin]]
@@ -45,14 +45,14 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"], optional = true }
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
-tokio = { version = "1.54", features = ["macros", "sync", "time"] }
+tokio = { version = "1.54", features = ["sync", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"], optional = true }
 toml = { version = "0.9", optional = true }
 url = { version = "2.5", optional = true }
 zeroize = "1.9"
 
 [dev-dependencies]
-tokio = { version = "1.54", features = ["test-util", "process", "rt", "io-util"] }
+tokio = { version = "1.54", features = ["macros", "test-util", "process", "rt", "io-util"] }
 h2 = "0.4"
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "aws_lc_rs"] }
 tempfile = "3.27"
