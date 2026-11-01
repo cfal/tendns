@@ -1,3 +1,9 @@
+//! Authenticated `td1` TXT publications, independent of transport and configuration.
+//!
+//! See the [wire specification](https://github.com/cfal/tendns/blob/main/DESIGN.md#the-td1-wire-format)
+//! for layout, owner binding, and a regression vector. [`decrypt`] is the read
+//! boundary: plaintext [`Publication::decode`] alone does not authenticate data.
+
 use std::{
     collections::HashMap,
     net::{Ipv4Addr, Ipv6Addr},
@@ -11,15 +17,23 @@ use zeroize::Zeroizing;
 
 use crate::names::{canonical_name, canonical_wire, entry_name, validate_label};
 
+/// Version prefix preceding unpadded base64url nonce, ciphertext, and tag.
 pub const PREFIX: &str = "td1.";
+/// Maximum encoded plaintext size per publication, in bytes.
 pub const MAX_PLAINTEXT: usize = 4096;
+/// Maximum entries in one publication or the resolver's combined owner publication.
 pub const MAX_ENTRIES: usize = 256;
+/// Maximum accepted TXT value size, including [`PREFIX`], in bytes.
 pub const MAX_ENCODED: usize = 5504;
+/// Accepted future issuance skew in seconds; expiry has no grace period.
 pub const CLOCK_SKEW: u64 = 60;
 
+/// A 32-byte symmetric discovery key, held in zeroizing storage.
+/// Key holders can both decrypt and create publications; this is not a password.
 pub struct Secret(Zeroizing<[u8; 32]>);
 
 impl Secret {
+    /// Decodes exactly 32 bytes from unpadded base64url.
     pub fn decode(value: &str) -> Result<Self> {
         let bytes =
             Zeroizing::new(URL_SAFE_NO_PAD.decode(value).map_err(|_| {
@@ -32,6 +46,8 @@ impl Secret {
         Ok(Self(Zeroizing::new(key)))
     }
 
+    /// Generates an OS-random key as unpadded base64url.
+    /// The caller owns protection and disposal of the returned plaintext string.
     pub fn generate() -> Result<String> {
         let mut key = Zeroizing::new([0u8; 32]);
         rand::fill(key.as_mut()).map_err(|_| anyhow::anyhow!("OS random generator failed"))?;
@@ -39,27 +55,40 @@ impl Secret {
     }
 }
 
+/// An address or exclusive alias for an entry's resulting hostname.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Value {
+    /// IPv4 address; destination restrictions belong to the caller.
     A(Ipv4Addr),
+    /// IPv6 address; destination restrictions belong to the caller.
     Aaaa(Ipv6Addr),
+    /// Absolute ASCII hostname target; cannot coexist with another entry for the name.
     Cname(Name),
 }
 
+/// One record at the public owner or one encrypted child label.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
+    /// Empty for the owner; otherwise one lowercase ASCII hostname label.
     pub subdomain: String,
+    /// Address or alias associated with the resulting hostname.
     pub value: Value,
 }
 
+/// Plaintext publication data. Construction alone performs no validation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Publication {
+    /// Unix seconds of issuance, not a sequence number or replacement priority.
     pub issued_at: u64,
+    /// Exclusive Unix-second expiry bound; must be later than issuance.
     pub expires_at: u64,
+    /// Nonempty array; aliases must be exclusive per resulting hostname.
     pub entries: Vec<Entry>,
 }
 
 impl Publication {
+    /// Checks names, entry count, alias exclusivity, and timestamp ordering.
+    /// Does not authenticate, check current time, or enforce encoded byte size.
     pub fn validate(&self, owner: &Name) -> Result<()> {
         ensure!(
             self.expires_at > self.issued_at,
@@ -96,6 +125,8 @@ impl Publication {
         Ok(())
     }
 
+    /// Checks expiry and future issuance against Unix seconds.
+    /// Does not perform structural validation; use [`Self::validate`] separately.
     pub fn validate_time(&self, now: u64) -> Result<()> {
         ensure!(self.expires_at > now, "publication has expired");
         ensure!(
@@ -105,6 +136,8 @@ impl Publication {
         Ok(())
     }
 
+    /// Structurally validates and serializes plaintext within [`MAX_PLAINTEXT`].
+    /// Does not encrypt or check current-time freshness; the caller owns these bytes.
     pub fn encode(&self, owner: &Name) -> Result<Vec<u8>> {
         self.validate(owner)?;
         let mut bytes = Vec::new();
@@ -135,6 +168,9 @@ impl Publication {
         Ok(bytes)
     }
 
+    /// Parses and structurally validates bounded plaintext, not ciphertext.
+    /// Does not authenticate or check current-time freshness. Use [`decrypt`]
+    /// for TXT data received from an untrusted source.
     pub fn decode(bytes: &[u8], owner: &Name) -> Result<Self> {
         ensure!(
             bytes.len() <= MAX_PLAINTEXT,
@@ -207,6 +243,9 @@ fn aad(owner: &Name) -> Vec<u8> {
     bytes
 }
 
+/// Validates and encrypts with a fresh random nonce, bound to the public TXT owner.
+/// Returns one `td1.` value; split into <=255-byte character-strings within one
+/// TXT RR when publishing to DNS. Does not check timestamps against current time.
 pub fn encrypt(publication: &Publication, secret: &Secret, owner: &Name) -> Result<String> {
     let mut nonce = [0u8; 12];
     rand::fill(&mut nonce).map_err(|_| anyhow::anyhow!("OS random generator failed"))?;
@@ -233,6 +272,9 @@ fn encrypt_with_nonce(
     Ok(format!("{PREFIX}{}", URL_SAFE_NO_PAD.encode(bytes)))
 }
 
+/// Authenticates owner-bound TXT data, validates structure, and checks Unix time.
+/// Concatenate character-strings within one TXT RR before calling, never separate
+/// RRs. Unsupported versions, wrong keys/owners, malformed data, and expiry fail.
 pub fn decrypt(value: &[u8], secret: &Secret, owner: &Name, now: u64) -> Result<Publication> {
     let publication = decrypt_for_update(value, secret, owner)?;
     publication.validate_time(now)?;

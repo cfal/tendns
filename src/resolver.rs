@@ -23,10 +23,13 @@ use crate::{
     upstream::Exchange,
 };
 
+/// Unix time for publication freshness checks, separate from monotonic cache time.
 pub trait Clock: Send + Sync {
+    /// Returns whole seconds since the Unix epoch, or an error if time is unavailable.
     fn now(&self) -> Result<u64>;
 }
 
+/// Wall clock backed by [`SystemTime`].
 pub struct SystemClock;
 
 impl Clock for SystemClock {
@@ -42,6 +45,7 @@ impl Clock for SystemClock {
 ///
 /// Create separate instances for different upstream policies, even when they use
 /// the same keys. The resolver never opens sockets or loads configuration files.
+/// Async deadline/cache operations require a Tokio runtime with its time driver.
 pub struct Resolver {
     policy: Arc<Policy>,
     upstream: Arc<dyn Exchange>,
@@ -66,13 +70,21 @@ enum Local {
 }
 
 /// Address-family selection for application lookups.
+///
+/// Applies to private and native-fallback results alike. This filters addresses;
+/// it does not reorder both families or implement connection racing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IpStrategy {
+    /// Retain only IPv4 addresses.
     Ipv4Only,
+    /// Retain only IPv6 addresses.
     Ipv6Only,
+    /// Retain only IPv4 if any exist; otherwise retain IPv6.
     #[default]
     Ipv4ThenIpv6,
+    /// Retain only IPv6 if any exist; otherwise retain IPv4.
     Ipv6ThenIpv4,
+    /// Retain both families in encounter order.
     Ipv4AndIpv6,
 }
 
@@ -90,10 +102,14 @@ impl IpStrategy {
     }
 }
 
-/// Negative private lookup results, distinct from authentication/transport errors.
+/// Negative address results, distinct from authentication/transport errors.
+///
+/// Carried inside `anyhow::Error`; use `downcast_ref::<LookupError>()` to inspect.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LookupError {
+    /// The private or hexadecimal name does not exist.
     NotFound,
+    /// No addresses remain after family selection, including from native fallback.
     NoData,
 }
 
@@ -109,10 +125,12 @@ impl std::fmt::Display for LookupError {
 impl std::error::Error for LookupError {}
 
 impl Resolver {
+    /// Creates an empty publication cache for this policy/upstream pair.
     pub fn new(policy: Arc<Policy>, upstream: Arc<dyn Exchange>) -> Self {
         Self::with_clock(policy, upstream, Arc::new(SystemClock))
     }
 
+    /// Injects Unix time for expiry tests; TTL aging and deadlines still use Tokio time.
     pub fn with_clock(
         policy: Arc<Policy>,
         upstream: Arc<dyn Exchange>,
@@ -129,11 +147,18 @@ impl Resolver {
     /// Answers a DNS message without an overall timeout. Packet-serving callers
     /// should apply [`validate_request`] before invoking this method, and either
     /// enforce their own deadline or use [`Self::answer_with_deadline`].
+    ///
+    /// Local absence/type misses are NXDOMAIN/empty NOERROR messages. Transport,
+    /// authentication, expiry, and alias failures return errors; callers choose
+    /// whether to map them to SERVFAIL. Returned messages are not UDP-size truncated.
     pub async fn answer(&self, request: Message) -> Result<Message> {
         self.answer_inner(request, None).await
     }
 
     /// Covers the entire request, including cache waits and all CNAME/TXT steps.
+    /// Uses one absolute Tokio deadline and returns [`crate::TimeoutError`] on
+    /// expiry. Validation, error mapping, and truncation obligations match
+    /// [`Self::answer`]. Timeouts cancel futures cooperatively, not blocking work.
     pub async fn answer_with_deadline(
         &self,
         request: Message,
@@ -144,6 +169,7 @@ impl Resolver {
             .context("DNS resolution timed out")?
     }
 
+    /// Returns the immutable policy associated with this resolver's cache.
     pub fn policy(&self) -> &Policy {
         &self.policy
     }
@@ -162,6 +188,10 @@ impl Resolver {
     ///
     /// Do not cache the returned addresses with a fixed lifetime: the resolver's
     /// own publication cache already enforces TTL and authenticated expiry.
+    /// Results contain no TTL metadata. Addresses are deduplicated in encounter
+    /// order after [`IpStrategy`] filtering, including native-fallback addresses.
+    /// Empty results return [`LookupError::NoData`]. Fallback errors retain the
+    /// application's error types; no fallback runs after a private failure.
     pub async fn lookup_ip<F, Fut>(
         &self,
         name: Name,
@@ -495,6 +525,9 @@ impl Resolver {
     }
 }
 
+/// Builds an empty response with the request's ID, opcode, and questions.
+/// Sets RA, clears AA/AD, and limits advertised EDNS payload size to 512-1232.
+/// Does not validate the request or enforce a serialized UDP size limit.
 pub fn local_response(request: &Message, code: ResponseCode) -> Message {
     let mut result = Message::response(request.metadata.id, request.metadata.op_code);
     result.metadata = Metadata::response_from_request(&request.metadata);
@@ -590,6 +623,14 @@ pub(crate) fn collect_publications(
     Ok((None, ttl))
 }
 
+/// Returns a rejection code for unsupported packet requests, or `None`.
+/// Requires opcode Query, exactly one IN question, no AXFR/IXFR, EDNS version
+/// zero, and an empty `Message::signature`. Hickory 0.26.3 populates that field from
+/// wire TSIG only with its DNSSEC feature enabled. Neither tendns build enables
+/// it; unless the host's dependency graph does, decoded TSIG stays in additionals,
+/// which this function does not inspect. Does not check the QR bit or reject
+/// SIG(0). Callers own those checks and response construction;
+/// [`Resolver::answer`] does not call this.
 pub fn validate_request(request: &Message) -> Option<ResponseCode> {
     if request.metadata.op_code != OpCode::Query {
         return Some(ResponseCode::NotImp);

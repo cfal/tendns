@@ -9,7 +9,7 @@ license = "MIT"
 readme = "README.md"
 keywords = ["dns", "dns-over-https", "encryption", "discovery"]
 categories = ["network-programming", "command-line-utilities"]
-include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE", "tendns.example.toml"]
+include = ["src/**", "tests/**", "Cargo.toml", "Cargo.lock", "README.md", "DESIGN.md", "LICENSE", "tendns.example.toml"]
 
 [features]
 default = ["cli"]

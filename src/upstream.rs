@@ -9,6 +9,7 @@ use crate::deadline;
 
 #[cfg(feature = "cli")]
 mod forwarder;
+/// Built-in UDP/TCP/DoH transport (requires the default `cli` feature).
 #[cfg(feature = "cli")]
 pub use forwarder::Forwarder;
 
@@ -16,12 +17,23 @@ pub use forwarder::Forwarder;
 ///
 /// Implementations must associate responses with their requests, and retry
 /// truncated UDP responses over a reliable transport before returning them.
+/// Return complete DNS messages, preserving RCODE, TTLs, TXT record/chunk
+/// boundaries, and negative-answer SOA records. NXDOMAIN is a response, not a
+/// transport error. Discovery reads only exact-owner IN TXT answers, not
+/// additionals; wrong response association can look like absence and cause a
+/// direct-owner query that discloses a hidden child label.
+///
+/// Calls may be concurrent. Caller cancellation or deadline expiry can drop the
+/// future; implementations must keep transport resources cancellation-safe.
 #[async_trait]
 pub trait Exchange: Send + Sync {
+    /// Performs one raw exchange, including transport-specific validation and retries.
     async fn exchange(&self, message: Message) -> Result<Message>;
 
     /// Uses the caller's absolute deadline, rather than restarting a timeout for
     /// each TXT owner or CNAME. Override when the underlying resolver supports it.
+    /// The default uses Tokio time and returns an error containing
+    /// [`crate::TimeoutError`] on expiry. Overrides must honor the same deadline.
     async fn exchange_with_deadline(&self, message: Message, deadline: Instant) -> Result<Message> {
         deadline::timeout_at(deadline, async { self.exchange(message).await })
             .await

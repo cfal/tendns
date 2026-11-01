@@ -3,19 +3,21 @@
 Run the suite without public DNS or HTTPS dependencies:
 
 ```sh
-CARGO_BUILD_JOBS=1 cargo test --all-targets
-CARGO_BUILD_JOBS=1 cargo test --no-default-features --all-targets
-CARGO_BUILD_JOBS=1 cargo test --no-default-features --doc
-CARGO_BUILD_JOBS=1 cargo test --all-targets -- --test-threads=1
-CARGO_BUILD_JOBS=1 cargo clippy --all-targets -- -D warnings
+CARGO_BUILD_JOBS=1 cargo test --all-targets --locked
+CARGO_BUILD_JOBS=1 cargo test --no-default-features --all-targets --locked
+CARGO_BUILD_JOBS=1 cargo test --no-default-features --doc --locked
+CARGO_BUILD_JOBS=1 cargo test --all-targets --locked -- --test-threads=1
+CARGO_BUILD_JOBS=1 cargo clippy --all-targets --locked -- -D warnings
+CARGO_BUILD_JOBS=1 cargo clippy --all-targets --no-default-features --locked -- -D warnings
+CARGO_BUILD_JOBS=1 cargo package --locked
 cargo fmt --all -- --check
 ```
 
 ## Coverage Map
 
-- `policy.rs`: format-independent namespace/limit validation, canonicalization,
-  suffix boundaries, and most-specific discovery-key selection.
-
+- `tests/policy.rs`: format-independent namespace/limit validation, canonicalization,
+  suffix boundaries, and most-specific discovery-key selection; also runs without
+  default features. Integration-test paths below are relative to `tests/`.
 - Unit tests in `src/protocol.rs`: wire regression vector, authenticated round trips,
   wrong keys/AAD/owners, tampering, malformed plaintext, truncation of all entry
   types, exact size/count/label limits, and timestamp boundaries.
@@ -36,7 +38,14 @@ cargo fmt --all -- --check
   fallback without private-name leakage, local CNAME chains, expiry after public
   fallback, absolute-deadline propagation, and cache-waiter cancellation. These
   tests and the protocol/resolution suites also run with default features disabled.
-- `request_policy.rs`: unsupported requests, TSIG refusal, flags, and EDNS limits.
+- `request_policy.rs`: unsupported requests, rejection of an in-memory
+  `Message::signature`, flags, and EDNS limits. Also runs without default features.
+  This is not a wire-TSIG rejection test: default Hickory features leave decoded
+  TSIG in additionals, which the validator does not inspect.
+- Unit tests in `src/upstream.rs`: default absolute-deadline enforcement, including
+  already-expired deadlines. The `src/lib.rs` doctest compiles an async transport
+  adapter and exercises hex lookup/native fallback in a library-only build.
+- Unit tests in `src/main.rs`: `--entry` parsing and Cloudflare argument groups.
 - `transport.rs` and `transport/doh.rs`: UDP/TCP framing and truncation, failover,
   TCP reconnection, DoH certificate/hostname and response checks, request deadlines,
   overload recovery, and encrypted discovery through real local DNS listeners.

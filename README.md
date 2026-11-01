@@ -1,8 +1,21 @@
 # tendns
 
-A Rust library and DNS forwarder for encrypted TXT discovery and hexadecimal IPv4
-names. The standalone binary supports UDP/TCP and HTTP/HTTPS listeners and DoH
-upstreams. Built on Hickory DNS. Licensed under MIT.
+A Rust library and DNS forwarder for dynamic discovery through encrypted DNS TXT
+records. Use public subdomain names for recognizable endpoints and tracking, or
+hide child labels inside a parent's encrypted publication. Both modes encrypt
+addresses; hidden-label privacy has [limits](#security-limits).
+
+Hexadecimal IPv4 names also let VPN/proxy applications route a domain suffix
+through a particular tunnel while selecting an exact internal destination, such
+as `0a14001e.via-vpn.internal` for `10.20.0.30`. Routing belongs to the host
+application; hex names are not encrypted.
+
+Embed the library in an existing resolver or run the binary with UDP/TCP and
+HTTP/HTTPS listeners and DoH upstreams. Built on Hickory DNS. MIT licensed.
+
+[Embed](#library) | [Run](#build-and-run) | [Publish](#generate-txt-values) |
+[Design and protocol](DESIGN.md) |
+[Tests](https://github.com/cfal/tendns/blob/main/tests/README.md)
 
 ## Library
 
@@ -15,12 +28,20 @@ The library-only build contains the protocol, validated `Policy`, `Resolver`, an
 `Exchange` transport interface. It does not include the CLI, TOML parser, DNS/HTTP
 servers, Cloudflare client, or built-in network forwarder. The default `cli`
 feature enables all standalone functionality, including `cargo install tendns`.
+Both builds require Rust 1.99.1 or newer and a C toolchain for AWS-LC. Async use
+requires a Tokio runtime with its time driver enabled. Use the re-exported
+`tendns::hickory_proto` types to avoid mismatched Hickory crate versions.
 
 Construct a `Policy` from `Discovery` domain/key pairs, hex zones, a TTL cap, and a
 publication-cache capacity. Domain canonicalization, overlap validation, and
 most-specific key selection are shared with the standalone server. Configuration
 formats and secret storage remain the embedding application's responsibility.
-See the [API documentation](https://docs.rs/tendns) for a construction example.
+See the [API documentation](https://docs.rs/tendns) for an adapter and lookup
+example, and [embedding contracts](DESIGN.md#embedded-resolver-contracts) for the
+complete integration requirements. The library also exposes
+`protocol::{Secret, Publication, encrypt}` for in-process publishing.
+For 0.1 callers migrating to 0.2, `Resolver::new` now takes `Arc<Policy>` instead
+of `Arc<Config>`; the `td1` wire format is unchanged.
 
 Implement `Exchange` using your existing raw DNS transport, then create a resolver
 with `Resolver::new(Arc<Policy>, Arc<dyn Exchange>)`. The transport must validate
@@ -44,25 +65,27 @@ upstream policy: do not share cached publications between split-horizon upstream
   Expiry is checked again after a public CNAME target resolves. `LookupError`
   distinguishes NXDOMAIN-like `NotFound` from family-specific `NoData` results.
 
-Deadlines enforced by the resolver and the default `Exchange` implementation
-return errors identifiable with `error.is::<tendns::TimeoutError>()`, whether the
-deadline has already elapsed or expires during the operation. Custom transports
-may also return their own error types.
+The `Then` family strategies return only the preferred family when available,
+otherwise the other family; `Ipv4AndIpv6` keeps both. This also filters fallback
+results. Inspect negative results with `error.downcast_ref::<tendns::LookupError>()`.
+Deadlines enforced by the resolver and the default `exchange_with_deadline`
+method return errors identifiable with `error.is::<tendns::TimeoutError>()`.
+Custom transports and native fallback may return their own error types.
+`Resolver::with_clock` supports injected Unix time for expiry tests; TTL aging and
+deadlines still use Tokio's monotonic clock.
 
 For strict namespace protection, pass absolute names and prevent the fallback
 from searching or aliasing into protected namespaces. Unclaimed relative names
 are passed through unchanged: a native search list could expand `nas` into
 `nas.example.com` and resolve it outside tendns. Native NSS alias expansion is
 likewise opaque to the library.
+Public CNAME chains followed inside an upstream/native resolver are also opaque:
+tendns does not intercept their intermediate targets.
 
 Do not wrap address results in a fixed-lifetime cache: it could outlive authenticated
 expiry. The resolver already caches publications with TTL/expiry checks. Recreate
 the policy/resolver when keys change. Admission limits and destination filtering
 (such as rejecting fake-IP ranges) belong to the embedding application.
-
-The Rust library API changed in 0.2: `Resolver::new` takes `Arc<Policy>` instead of
-the server's `Arc<Config>`. Standalone TOML, CLI commands, and the `td1` wire format
-are unchanged.
 
 ## Build and run
 
@@ -91,11 +114,31 @@ dig @127.0.0.1 -p 5300 example.net A +tcp
 Protect configuration files containing keys with appropriate filesystem
 permissions, such as mode `0600`. `tendns.toml` is ignored by Git. Keys are
 32 random bytes represented as unpadded base64url, not passwords.
+The server exits gracefully on SIGINT or SIGTERM.
+
+### Configuration
+
+See [tendns.example.toml](tendns.example.toml) for namespace keys, upstreams, and
+listeners. Top-level settings:
+
+| Setting | Default | Meaning and bounds |
+| --- | --- | --- |
+| `ttl` | `60` | Positive seconds; synthesized/negative-cache TTL cap and Cloudflare Set's requested TXT TTL |
+| `valid_for` | `"24h"` | Publication validity; at least 1s, no fixed maximum validity window |
+| `upstream_timeout` | `"3s"` | Per upstream connection attempt; at least 1s |
+| `request_timeout` | `"10s"` | Resolution budget; 1s-24h; also used separately for HTTP transport timers |
+| `cache_capacity` | `1024` | Resident publication-cache owner slots; 1-65536, not a byte limit or LRU |
+| `max_inflight` | `256` | Shared resolver admission limit; 1-65536; also per-listener HTTP connection/request limits |
+
+Resolver admission is immediate: overload returns SERVFAIL rather than queueing.
+At least one upstream is required for `serve`, including hex-only configurations;
+offline TXT generation does not require one. Upstreams must provide interchangeable
+DNS views: they are a failover list, not per-domain routes.
 
 ## Listeners and DoH
 
-Listeners use typed TOML entries. This replaces the earlier `listen = [...]`
-format. With no `listeners` specified, the default is UDP/TCP on `0.0.0.0:5300`.
+Listeners use typed TOML entries. With no `listeners` specified, the default is
+UDP/TCP on `0.0.0.0:5300`.
 An explicit list can contain only HTTP/HTTPS listeners, without ordinary DNS.
 
 ```toml
@@ -133,6 +176,8 @@ contain no whitespace, and use the bearer-token alphabet (letters, digits,
 `-._~+/`, and optional trailing `=`). Limits: 1024 tokens per listener, 1024 bytes
 per token, 1 MiB per file. `tendns keygen` can generate suitable random tokens;
 generate separate values rather than reusing discovery encryption keys.
+Tokens grant equivalent access to the listener's resolver, not per-domain or
+per-token authorization rules.
 
 An empty combined token list disables authentication and prints a warning for
 that listener. Missing or invalid credentials produce HTTP 401 with a Bearer
@@ -177,20 +222,9 @@ POST bodies to 65535 bytes, and body reads to `request_timeout` (1s-24h). HTTP c
 and in-flight HTTP requests are each bounded by `max_inflight` per listener.
 Connections are rotated after five minutes, with a short graceful-close window.
 No CORS access or client-subnet parameter support is enabled.
-
-## Releases
-
-The `release-*` branch builds and tests the same source as the `v*` release tag.
-Dependencies use broad manifest constraints; `Cargo.lock` fixes the exact
-release graph, and CI builds with `--locked`. Binary releases are distributed
-through GitHub; the library and installable CLI are packaged for crates.io.
-
-The release workflow packages and smoke-tests eight binaries: Linux x86_64
-(GNU and musl), Linux aarch64 (GNU and musl), Linux armv7 (GNU and musl), and
-macOS x86_64 and aarch64. Each archive contains `tendns`, this README, `LICENSE`, and
-`tendns.example.toml`; the release includes `SHA256SUMS` and build-provenance
-attestations. A tag creates a draft release after all builds pass. The draft is
-published only after reviewing the artifacts.
+TLS, HTTP headers, and body reads have separate timeout phases. The resolver's
+absolute deadline starts when resolution begins, not at connection acceptance;
+`request_timeout` is not one end-to-end HTTP connection budget.
 
 ## Generate TXT values
 
@@ -229,7 +263,8 @@ tendns --config tendns.toml txt --name example.com \
 ```
 
 `--entry` is repeatable and uses `LABEL:TYPE:VALUE`; `@` selects the public TXT
-owner. Labels contain at most 63 ASCII letters/digits/hyphens, not dots.
+owner. Nonempty labels contain 1-63 ASCII letters/digits/hyphens, no dots, and
+no leading/trailing hyphen.
 Internationalized names must use Punycode. `--cname target.example.net` is a
 shortcut for an alias at the owner or the current `--subdomain`. An alias cannot
 coexist with another entry at the same resulting hostname.
@@ -237,6 +272,8 @@ coexist with another entry at the same resulting hostname.
 The value begins `td1.` and uses AES-256-GCM-SIV with a fresh random IV and an
 authentication tag. It is bound to the public TXT owner: moving it to a different
 name will not work. The CLI prints only the value on stdout; errors use stderr.
+See [the protocol specification](DESIGN.md#the-td1-wire-format) for the exact
+encoding, limits, and regression vector.
 Values longer than 255 bytes must be split into adjacent character-strings
 within **one** TXT record, with no inserted spaces in the data. Do not publish
 the fragments as separate records. The server concatenates strings per RR.
@@ -261,8 +298,10 @@ specifies the public TXT owner. By default these commands edit TXT at the
 immediate parent (`example.com`) and keep the child label (`nas` or `www`)
 encrypted. `--direct` edits TXT at the exact hostname with an empty hidden label.
 At a configured discovery domain's apex, `--direct` is required: publishing in
-its parent would cross the key boundary. A direct set is refused when an existing
-parent entry shadows it or the parent TXT lookup would fail validation.
+its parent would cross the key boundary. When the parent is inside that boundary,
+a direct set requires read access to the parent's Cloudflare zone. An inaccessible
+zone, parent CNAME, shadowing entry, or invalid parent TXT refuses the set. This
+checks API-visible records, not recursive DNS caches or other split-horizon views.
 
 Set reuses the owner's existing `td1` TXT: decrypt, edit the array, re-encrypt,
 and PATCH the same Cloudflare record. It creates a TXT record only when none
@@ -286,6 +325,8 @@ multiple publications manually before managing that owner with these commands.
 Set applies the configured `ttl`, which must be 60–86400 seconds or `1` for
 Cloudflare Auto (normally 300 seconds). Values are split into quoted TXT strings;
 provider size limits and the resolver's record limits are checked before writing.
+`ttl = 1` still caps tendns's synthesized answers at one second; Auto changes the
+provider TTL, not the local policy cap.
 
 Run only one writer per TXT owner. Cloudflare does not provide a documented
 conditional update for this read-modify-write operation; concurrent commands can
@@ -307,35 +348,50 @@ does permit a direct TXT lookup, which exposes the queried name upstream. For
 both locations, absence produces NXDOMAIN; an existing name without the
 requested type produces NODATA. There is no fallback to plaintext A/AAAA inside
 a discovery domain. CNAME targets are followed with loop/depth bounds.
+All query types at claimed names use local semantics: public TXT/MX/NS/SOA records
+are not passed through, including publication TXT. A local CNAME may still lead
+to public records outside the configured namespaces.
 An owner containing only hidden children, and the hex-zone apex, return NODATA
 rather than NXDOMAIN so downstream caches do not suppress their children.
 
-Multiple encrypted TXT values contribute independent entries. Duplicate entries
-are deduplicated; CNAME/address conflicts at the same hostname are errors.
+Multiple encrypted TXT values contribute independent entries. Exact duplicates
+across publications are deduplicated; CNAME/address conflicts are errors. Within
+one publication a CNAME must be the only entry for its hostname.
 Publish independent `td1.` values as separate TXT records, not strings within one RR.
 Timestamps validate freshness, not replacement order. Replace or remove old TXT
 values explicitly when updating. An invalid or expired encrypted value fails the
 lookup, including when other values are valid: it might contain the hidden label
 being queried. Publication is operator-triggered; regenerate and republish before expiry,
 including when addresses are unchanged.
+Ordinary TXT values are skipped for decryption but still count toward the limit
+of 16 exact-owner IN TXT records and `16 * 5504` aggregate data bytes. A crowded
+apex can therefore prevent discovery even when its encrypted TXT is valid.
 
 For a configured hex zone, `c0000201.hex.example.net` resolves to `192.0.2.1`.
 Exactly one eight-character ASCII hexadecimal label is accepted, including
 uppercase. All IPv4 addresses are permitted, including private and loopback
-addresses. AAAA and other unsupported types return NODATA; invalid names within
-the zone return NXDOMAIN. Hex and discovery zones cannot overlap.
+addresses. A and ANY return the synthesized A record; other permitted types
+return NODATA. Invalid names within the zone return NXDOMAIN. Hex and discovery
+zones cannot overlap.
 
 Names outside configured zones are forwarded. Plain upstreams use UDP with TCP
 fallback. DoH uses certificate-verified HTTPS/HTTP2 with explicit bootstrap IPs,
-so starting the proxy does not depend on the system DNS resolver. Upstreams are
-tried in configured order. Plain fallback exists only when explicitly configured.
-Transfers, updates, TSIG, and multi-question requests are not supported.
+so startup does not depend on the system DNS resolver. Targets are tried in
+configured order, including each DoH bootstrap IP. Transport failures and
+SERVFAIL/REFUSED permit failover; NXDOMAIN is returned immediately. Plain fallback
+exists only when explicitly configured.
+Transfers, updates, and multi-question requests are rejected. TSIG/SIG(0)
+authentication is not implemented; the request validator does not reject wire
+TSIG with the default Hickory features. See
+[packet validation](DESIGN.md#embedded-resolver-contracts).
 
 Discovery caching is bounded and never extends the source TTL or authenticated
-expiry. Concurrent requests for the same cached owner share a fetch. Generic
-forwarding uses upstream caches rather than adding another response cache.
+expiry. Fetches are serialized per resident owner slot; errors, zero TTL,
+cancellation, or eviction can cause another fetch. Generic forwarding uses
+upstream caches rather than adding another response cache.
 Synthetic answers do not assert DNSSEC validation. Operators using downstream
 DNSSEC validation must configure the local namespaces accordingly.
+See [DESIGN.md](DESIGN.md) for the full resolution and cache contracts.
 
 ## Security limits
 
@@ -344,6 +400,11 @@ the configured key can decrypt and create publications for its domain. Public
 TXT owners, query patterns, ciphertext sizes, and update timing remain visible.
 Hex labels directly disclose the encoded address. Service authentication and
 network access control remain separate from discovery.
+An untrusted upstream or attacker able to suppress parent TXT data can induce a
+direct-owner lookup and expose a hidden child label: absence is not authenticated.
+DoH authenticates the upstream connection, not publication completeness. For
+proxies, unfiltered discovery/hex destinations can enable SSRF to internal or
+loopback services; apply destination policy outside tendns.
 
 There is no persistent replay state. Authentic older values may be accepted
 until expiry; a reasonably correct clock is required. SIV is a safety net against
@@ -352,13 +413,22 @@ erase addresses clients already learned. Configuration keys are separate from
 provider API credentials. Only the Cloudflare publishing commands need a provider
 token, read from `CLOUDFLARE_API_TOKEN`; the DNS server does not.
 
-## Check
+## Releases
 
-```sh
-CARGO_BUILD_JOBS=1 cargo test --all-targets
-CARGO_BUILD_JOBS=1 cargo clippy --all-targets -- -D warnings
-cargo fmt --all -- --check
-```
+Binary releases are on [GitHub](https://github.com/cfal/tendns/releases); the
+library and installable CLI are on [crates.io](https://crates.io/crates/tendns).
+The `release-*` branch builds and tests the same source as the `v*` release tag.
+`Cargo.lock` pins the release graph; CI builds with `--locked`. Embedders resolve
+the manifest's dependency constraints in their own graph.
+
+The workflow packages and smoke-tests eight binaries: Linux x86_64, aarch64, and
+armv7 (each GNU and musl), plus macOS x86_64 and aarch64. Archives contain `tendns`,
+`README.md`, `DESIGN.md`, `LICENSE`, and `tendns.example.toml`; releases include
+`SHA256SUMS` and build-provenance attestations. Tags create drafts after all builds
+pass; publication follows artifact review.
+
+## Development
 
 Tests use local DNS and HTTPS fixtures; they do not require a public resolver.
-The server exits gracefully on SIGINT or SIGTERM.
+See the [test guide](https://github.com/cfal/tendns/blob/main/tests/README.md) for
+default/library-only tests, doctests, lint, packaging checks, and remaining gaps.
