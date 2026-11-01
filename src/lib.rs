@@ -29,6 +29,7 @@
 pub mod cloudflare;
 #[cfg(feature = "cli")]
 pub mod config;
+mod deadline;
 pub mod names;
 pub mod policy;
 pub mod protocol;
@@ -37,6 +38,7 @@ pub mod resolver;
 pub mod server;
 pub mod upstream;
 
+pub use deadline::TimeoutError;
 pub use hickory_proto;
 pub use policy::{Discovery, Policy};
 pub use resolver::{IpStrategy, LookupError, Resolver};

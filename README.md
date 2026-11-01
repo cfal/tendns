@@ -44,6 +44,11 @@ upstream policy: do not share cached publications between split-horizon upstream
   Expiry is checked again after a public CNAME target resolves. `LookupError`
   distinguishes NXDOMAIN-like `NotFound` from family-specific `NoData` results.
 
+Deadlines enforced by the resolver and the default `Exchange` implementation
+return errors identifiable with `error.is::<tendns::TimeoutError>()`, whether the
+deadline has already elapsed or expires during the operation. Custom transports
+may also return their own error types.
+
 For strict namespace protection, pass absolute names and prevent the fallback
 from searching or aliasing into protected namespaces. Unclaimed relative names
 are passed through unchanged: a native search list could expand `nas` into

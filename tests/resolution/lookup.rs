@@ -1,6 +1,6 @@
 use super::*;
 use std::{future::pending, net::IpAddr, time::Duration};
-use tendns::{IpStrategy, LookupError};
+use tendns::{IpStrategy, LookupError, TimeoutError};
 use tokio::time::Instant;
 
 async fn no_fallback(_: Name, _: Instant) -> Result<Vec<IpAddr>> {
@@ -200,6 +200,45 @@ async fn lookup_rechecks_authenticated_expiry_after_public_fallback() {
 }
 
 #[tokio::test]
+async fn expired_private_chain_never_starts_native_fallback() {
+    let (policy, mock, clock, resolver) = setup();
+    let mut first = publication(vec![alias("a", "b.sub.example.com")], 100);
+    first.expires_at = 101;
+    let mut parent = reply();
+    parent.answers.push(txt(&policy, "example.com", &first, 60));
+    mock.set("example.com", RecordType::TXT, parent);
+    let mut next = reply();
+    next.answers.push(txt(
+        &policy,
+        "sub.example.com",
+        &publication(vec![alias("b", "external.test")], 100),
+        60,
+    ));
+    mock.set("sub.example.com", RecordType::TXT, next);
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    *mock.gate.lock().unwrap() = Some(gate.clone());
+    let future = resolver.lookup_ip(
+        canonical_name("a.example.com").unwrap(),
+        IpStrategy::Ipv4Only,
+        deadline(),
+        no_fallback,
+    );
+    tokio::pin!(future);
+    assert_pending(future.as_mut()).await;
+    clock.0.store(101, Ordering::SeqCst);
+    gate.add_permits(1);
+    let error = future.await.unwrap_err();
+    assert!(error.to_string().contains("expired during resolution"));
+    assert_eq!(
+        mock.calls(),
+        vec![
+            ("example.com.".into(), RecordType::TXT),
+            ("sub.example.com.".into(), RecordType::TXT),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn missing_invalid_and_expired_publications_never_fall_back() {
     for mode in ["missing", "invalid", "expired", "unavailable"] {
         let (config, mock, clock, resolver) = setup();
@@ -238,6 +277,7 @@ async fn missing_invalid_and_expired_publications_never_fall_back() {
             )
             .await
             .unwrap_err();
+        assert!(!error.is::<TimeoutError>(), "{mode}: {error:#}");
         if mode == "missing" {
             assert_eq!(
                 error.downcast_ref::<LookupError>(),
@@ -380,7 +420,90 @@ async fn one_deadline_covers_parent_and_direct_txt_queries() {
     assert_pending(future.as_mut()).await;
     assert_eq!(*mock.deadlines.lock().unwrap(), vec![end, end]);
     tokio::time::advance(Duration::from_secs(2)).await;
-    assert!(future.await.unwrap_err().to_string().contains("timed out"));
+    let error = future.await.unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(error.is::<TimeoutError>());
+}
+
+#[tokio::test(start_paused = true)]
+async fn elapsed_deadline_does_not_start_the_next_txt_query() {
+    let (_, mock, _, resolver) = setup();
+    mock.set("example.com", RecordType::TXT, reply());
+    mock.set("nas.example.com", RecordType::TXT, reply());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *mock.gate.lock().unwrap() = Some(gate.clone());
+    let end = Instant::now() + Duration::from_secs(5);
+    let future = resolver.answer_with_deadline(query("nas.example.com", RecordType::A), end);
+    tokio::pin!(future);
+    assert_pending(future.as_mut()).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    gate.add_permits(1);
+    let error = future.await.unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(error.is::<TimeoutError>());
+    assert_eq!(mock.calls(), vec![("example.com.".into(), RecordType::TXT)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn elapsed_deadline_does_not_start_native_fallback() {
+    let (policy, mock, _, resolver) = setup();
+    set_parent_entries(&policy, &mock, vec![alias("www", "external.test")]);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *mock.gate.lock().unwrap() = Some(gate.clone());
+    let end = Instant::now() + Duration::from_secs(5);
+    let future = resolver.lookup_ip(
+        canonical_name("www.example.com").unwrap(),
+        IpStrategy::Ipv4Only,
+        end,
+        |_, _| -> std::future::Ready<Result<Vec<IpAddr>>> {
+            panic!("expired deadline must not invoke the fallback closure");
+        },
+    );
+    tokio::pin!(future);
+    assert_pending(future.as_mut()).await;
+    tokio::time::advance(Duration::from_secs(5)).await;
+    gate.add_permits(1);
+    let error = future.await.unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(error.is::<TimeoutError>());
+    assert_eq!(mock.calls(), vec![("example.com.".into(), RecordType::TXT)]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn elapsed_deadline_rejects_a_ready_private_answer() {
+    for address_lookup in [false, true] {
+        let (policy, mock, _, resolver) = setup();
+        set_parent_entries(&policy, &mock, vec![entry("nas", "192.0.2.1")]);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        *mock.gate.lock().unwrap() = Some(gate.clone());
+        let end = Instant::now() + Duration::from_secs(5);
+        let future = async {
+            if address_lookup {
+                resolver
+                    .lookup_ip(
+                        canonical_name("nas.example.com").unwrap(),
+                        IpStrategy::Ipv4Only,
+                        end,
+                        no_fallback,
+                    )
+                    .await
+                    .map(|_| ())
+            } else {
+                resolver
+                    .answer_with_deadline(query("nas.example.com", RecordType::A), end)
+                    .await
+                    .map(|_| ())
+            }
+        };
+        tokio::pin!(future);
+        assert_pending(future.as_mut()).await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        gate.add_permits(1);
+        let error = future.await.unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(error.is::<TimeoutError>());
+        assert_eq!(mock.calls(), vec![("example.com.".into(), RecordType::TXT)]);
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -395,25 +518,25 @@ async fn deadline_covers_native_fallback_and_already_expired_requests_do_no_work
             |_, _| pending::<Result<Vec<IpAddr>>>(),
         )
         .await;
-    assert!(result.unwrap_err().to_string().contains("timed out"));
+    let error = result.unwrap_err();
+    assert!(error.to_string().contains("timed out"));
+    assert!(error.is::<TimeoutError>());
     assert_eq!(Instant::now(), end);
-    assert!(
-        resolver
-            .answer_with_deadline(query("nas.example.com", RecordType::A), end)
-            .await
-            .is_err()
-    );
-    assert!(
-        resolver
-            .lookup_ip(
-                canonical_name("external.test").unwrap(),
-                IpStrategy::Ipv4Only,
-                end,
-                no_fallback
-            )
-            .await
-            .is_err()
-    );
+    let error = resolver
+        .answer_with_deadline(query("nas.example.com", RecordType::A), end)
+        .await
+        .unwrap_err();
+    assert!(error.is::<TimeoutError>());
+    let error = resolver
+        .lookup_ip(
+            canonical_name("external.test").unwrap(),
+            IpStrategy::Ipv4Only,
+            end,
+            no_fallback,
+        )
+        .await
+        .unwrap_err();
+    assert!(error.is::<TimeoutError>());
     assert!(mock.calls().is_empty());
 }
 

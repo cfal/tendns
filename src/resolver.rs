@@ -17,6 +17,7 @@ use hickory_proto::{
 use tokio::{sync::Mutex, time::Instant};
 
 use crate::{
+    deadline,
     policy::{Discovery, Policy},
     protocol::{self, Entry, Publication, Value},
     upstream::Exchange,
@@ -138,8 +139,7 @@ impl Resolver {
         request: Message,
         deadline: Instant,
     ) -> Result<Message> {
-        ensure!(Instant::now() < deadline, "DNS resolution timed out");
-        tokio::time::timeout_at(deadline, self.answer_inner(request, Some(deadline)))
+        deadline::timeout_at(deadline, self.answer_inner(request, Some(deadline)))
             .await
             .context("DNS resolution timed out")?
     }
@@ -173,8 +173,7 @@ impl Resolver {
         F: FnOnce(Name, Instant) -> Fut,
         Fut: Future<Output = Result<Vec<IpAddr>>>,
     {
-        ensure!(Instant::now() < deadline, "DNS resolution timed out");
-        tokio::time::timeout_at(deadline, async {
+        deadline::timeout_at(deadline, async {
             let mut name = name;
             if self.policy.claims(&name) {
                 name = name.to_lowercase();
@@ -185,7 +184,11 @@ impl Resolver {
             for _ in 0..16 {
                 ensure!(seen.insert(name.clone()), "CNAME loop");
                 let mut addresses = match self.local(&name, Some(deadline)).await? {
-                    Local::Forward => fallback(name, deadline).await?,
+                    Local::Forward => {
+                        self.remaining_validity(expires_at)?;
+                        deadline::check(deadline).context("DNS resolution timed out")?;
+                        fallback(name, deadline).await?
+                    }
                     Local::Missing => {
                         self.remaining_validity(expires_at)?;
                         return Err(LookupError::NotFound.into());
@@ -340,6 +343,7 @@ impl Resolver {
     async fn exchange(&self, request: Message, deadline: Option<Instant>) -> Result<Message> {
         match deadline {
             Some(deadline) => {
+                deadline::check(deadline).context("DNS resolution timed out")?;
                 self.upstream
                     .exchange_with_deadline(request, deadline)
                     .await

@@ -5,6 +5,8 @@ use async_trait::async_trait;
 use hickory_proto::op::Message;
 use tokio::time::Instant;
 
+use crate::deadline;
+
 #[cfg(feature = "cli")]
 mod forwarder;
 #[cfg(feature = "cli")]
@@ -21,7 +23,7 @@ pub trait Exchange: Send + Sync {
     /// Uses the caller's absolute deadline, rather than restarting a timeout for
     /// each TXT owner or CNAME. Override when the underlying resolver supports it.
     async fn exchange_with_deadline(&self, message: Message, deadline: Instant) -> Result<Message> {
-        tokio::time::timeout_at(deadline, self.exchange(message))
+        deadline::timeout_at(deadline, async { self.exchange(message).await })
             .await
             .context("DNS exchange timed out")?
     }
@@ -49,6 +51,26 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "DNS exchange timed out");
+        assert!(error.is::<crate::TimeoutError>());
         assert_eq!(Instant::now(), deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn default_exchange_does_not_poll_work_after_its_deadline() {
+        struct UnusedExchange;
+
+        #[async_trait]
+        impl Exchange for UnusedExchange {
+            async fn exchange(&self, _: Message) -> Result<Message> {
+                panic!("expired deadline must not poll the exchange");
+            }
+        }
+
+        let error = UnusedExchange
+            .exchange_with_deadline(Message::query(), Instant::now())
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "DNS exchange timed out");
+        assert!(error.is::<crate::TimeoutError>());
     }
 }
